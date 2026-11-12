@@ -1,0 +1,329 @@
+From 01e5efd11ebd6569541a92bbcedca80a8ebf2ad0 Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Thu, 12 Nov 2026 08:39:42 +0800
+Subject: [PATCH 08/12] feat(desktop): configure fork auto-update feed and
+ automated patched release workflow
+
+---
+ .github/workflows/fork-sync-release.yml | 185 ++++++++++++++++++++++++
+ electron-builder.yml                    |   2 +-
+ package.json                            |   1 +
+ scripts/build-desktop-win.mjs           |  11 +-
+ scripts/patch-sync.mjs                  |  27 +++-
+ 5 files changed, 220 insertions(+), 6 deletions(-)
+ create mode 100644 .github/workflows/fork-sync-release.yml
+
+diff --git a/.github/workflows/fork-sync-release.yml b/.github/workflows/fork-sync-release.yml
+new file mode 100644
+index 0000000..8878689
+--- /dev/null
++++ b/.github/workflows/fork-sync-release.yml
+@@ -0,0 +1,185 @@
++name: Fork Sync & Patched Desktop Release
++
++on:
++  schedule:
++    - cron: "0 */6 * * *"
++  workflow_dispatch:
++    inputs:
++      force_release:
++        description: "Force build and release even if version tag already exists"
++        required: false
++        type: boolean
++        default: false
++
++permissions:
++  contents: write
++
++concurrency:
++  group: fork-sync-release
++  cancel-in-progress: false
++
++env:
++  NEXT_TELEMETRY_DISABLED: "1"
++
++jobs:
++  sync-and-check:
++    name: Sync upstream & check release
++    if: github.repository == 'hmnty11/learnharness'
++    runs-on: ubuntu-24.04
++    timeout-minutes: 20
++    outputs:
++      should_release: ${{ steps.check.outputs.should_release }}
++      version: ${{ steps.check.outputs.version }}
++      tag: ${{ steps.check.outputs.tag }}
++    steps:
++      - uses: actions/checkout@v7
++        with:
++          fetch-depth: 0
++          token: ${{ secrets.GITHUB_TOKEN }}
++      - uses: actions/setup-node@v7
++        with:
++          node-version: "26"
++          cache: npm
++      - name: Configure git identity
++        run: |
++          git config user.name "github-actions[bot]"
++          git config user.email "github-actions[bot]@users.noreply.github.com"
++      - name: Fetch upstream and tags
++        run: |
++          git remote add upstream https://github.com/amosblomqvist/learnharness.git || git remote set-url upstream https://github.com/amosblomqvist/learnharness.git
++          git fetch upstream main --tags
++      - name: Sync with upstream if new commits exist
++        run: |
++          if ! git merge-base --is-ancestor upstream/main HEAD; then
++            echo "New upstream commits detected! Running patch:sync..."
++            npm ci
++            npm run patch:sync
++            if [ -d "patches" ]; then
++              git add patches/
++              git commit -m "chore(patches): refresh patches against upstream" || true
++            fi
++            echo "Pushing synced main branch to origin/main..."
++            git push origin main
++          else
++            echo "Fork main is already up to date with upstream/main."
++          fi
++      - name: Check version and release status
++        id: check
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          FORCE_RELEASE: ${{ inputs.force_release }}
++        run: |
++          VERSION=$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")
++          TAG="v${VERSION}"
++          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
++          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
++
++          EXISTS="false"
++          if gh release view "$TAG" --repo hmnty11/learnharness >/dev/null 2>&1; then
++            IS_DRAFT=$(gh release view "$TAG" --repo hmnty11/learnharness --json isDraft -q .isDraft 2>/dev/null || echo "false")
++            if [ "$IS_DRAFT" = "false" ]; then
++              EXISTS="true"
++            fi
++          fi
++
++          if [ "$EXISTS" = "false" ] || [ "$FORCE_RELEASE" = "true" ]; then
++            echo "Release $TAG needs to be built and published."
++            echo "should_release=true" >> "$GITHUB_OUTPUT"
++            if ! gh release view "$TAG" --repo hmnty11/learnharness >/dev/null 2>&1; then
++              echo "Creating initial draft release $TAG on hmnty11/learnharness..."
++              gh release create "$TAG" --repo hmnty11/learnharness --draft --title "LearnHarness $TAG (Patched)" --notes "LearnHarness $TAG with custom fork patches for hmnty11/learnharness."
++            fi
++          else
++            echo "Release $TAG is already published on hmnty11/learnharness. Skipping release build."
++            echo "should_release=false" >> "$GITHUB_OUTPUT"
++          fi
++
++  package:
++    name: Package (${{ matrix.platform }})
++    needs: sync-and-check
++    if: needs.sync-and-check.outputs.should_release == 'true'
++    permissions:
++      contents: write
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - os: windows-2025
++            platform: windows-x64
++            builder_args: --win --x64
++          - os: ubuntu-24.04
++            platform: linux-x64
++            builder_args: --linux --x64
++    runs-on: ${{ matrix.os }}
++    timeout-minutes: 60
++    defaults:
++      run:
++        shell: bash
++    steps:
++      - uses: actions/checkout@v7
++        with:
++          ref: main
++      - uses: actions/setup-node@v7
++        with:
++          node-version: "26"
++          cache: npm
++      - run: npm ci
++      - run: npm run plugins:setup
++      - name: Native renderer tests on this OS
++        run: npx electron --import tsx --test tests/pdf-native-render.test.ts tests/pdf-ops.test.ts tests/svg-native-render.test.ts tests/browser-service.test.ts
++        env:
++          NODE_ENV: test
++          ELECTRON_RUN_AS_NODE: "1"
++      - run: npm run build
++      - run: node scripts/smoke-provider-runtime.mjs
++      - run: node scripts/build-server.mjs
++      - run: node scripts/smoke-server.mjs --electron
++      - name: Package desktop app and upload to draft release
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        run: npx electron-builder ${{ matrix.builder_args }} --publish always
++      - name: Initialize packaged providers offline
++        run: |
++          case "$RUNNER_OS" in
++            Windows)
++              payload="dist/win-unpacked/resources/server/standalone"
++              runtime="dist/win-unpacked/LearnHarness.exe"
++              ;;
++            Linux)
++              payload="dist/linux-unpacked/resources/server/standalone"
++              runtime="dist/linux-unpacked/learnharness"
++              ;;
++          esac
++          node scripts/smoke-provider-runtime.mjs --standalone "$payload"
++          node scripts/smoke-provider-runtime.mjs --standalone "$payload" --runtime "$runtime"
++      - name: Save installers and update metadata
++        uses: actions/upload-artifact@v7
++        with:
++          name: learnharness-fork-${{ matrix.platform }}
++          retention-days: 7
++          if-no-files-found: ignore
++          path: |
++            dist/*.exe
++            dist/*.AppImage
++            dist/*.deb
++            dist/*.blockmap
++            dist/latest*.yml
++
++  publish:
++    name: Publish release to GitHub
++    needs: [sync-and-check, package]
++    if: needs.sync-and-check.outputs.should_release == 'true'
++    runs-on: ubuntu-24.04
++    timeout-minutes: 10
++    permissions:
++      contents: write
++    steps:
++      - uses: actions/checkout@v7
++      - name: Publish draft release on hmnty11/learnharness
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          TAG: ${{ needs.sync-and-check.outputs.tag }}
++        run: |
++          echo "Publishing release $TAG on hmnty11/learnharness..."
++          gh release edit "$TAG" --repo hmnty11/learnharness --draft=false --latest
++          echo "Successfully published $TAG! Desktop clients pointing to hmnty11/learnharness will now auto-update."
+diff --git a/electron-builder.yml b/electron-builder.yml
+index cb0dce6..400e822 100644
+--- a/electron-builder.yml
++++ b/electron-builder.yml
+@@ -188,7 +188,7 @@ publish:
+   # would be a leak. desktop:dist passes no --publish flag, so builds never
+   # upload; publishing happens at release time (GH_TOKEN + --publish).
+   - provider: github
+-    owner: amosblomqvist
++    owner: hmnty11
+     repo: learnharness
+     # All three CI jobs contribute assets; only the owner publishes it.
+     releaseType: draft
+diff --git a/package.json b/package.json
+index e0a0dc2..04cd830 100644
+--- a/package.json
++++ b/package.json
+@@ -27,6 +27,7 @@
+ 		"desktop:dist": "rm -rf dist .next/standalone && npm run build && node scripts/smoke-provider-runtime.mjs && node scripts/build-server.mjs && node scripts/smoke-server.mjs && DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer} APPLE_KEYCHAIN_PROFILE=LH_NOTARY APPLE_TEAM_ID=JS6XN22HY6 electron-builder --mac --arm64",
+ 		"desktop:dist:win": "node scripts/build-desktop-win.mjs",
+ 		"desktop:dist:win:dir": "node scripts/build-desktop-win.mjs --dir",
++		"desktop:release:win": "node scripts/build-desktop-win.mjs --publish",
+ 		"patch:export": "node scripts/patch-sync.mjs export",
+ 		"patch:sync": "node scripts/patch-sync.mjs sync",
+ 		"patch:apply": "node scripts/patch-sync.mjs apply",
+diff --git a/scripts/build-desktop-win.mjs b/scripts/build-desktop-win.mjs
+index 406f708..dabbb32 100644
+--- a/scripts/build-desktop-win.mjs
++++ b/scripts/build-desktop-win.mjs
+@@ -8,8 +8,7 @@
+  *
+  * Steps:
+  *   1. Clean dist/ and .next/standalone
+- *   2. Build Next.js in standalone mode (next build)
+- *   3. Smoke-test provider runtime (scripts/smoke-provider-runtime.mjs)
++ *   2. Build plugins & Next.js in standalone mode
+  *   4. Curate server standalone payload (scripts/build-server.mjs)
+  *   5. Smoke-test standalone server boot (scripts/smoke-server.mjs)
+  *   6. Package Windows desktop app with electron-builder
+@@ -31,6 +30,7 @@ const BUILDER_CLI = require.resolve('electron-builder/cli.js');
+ const args = process.argv.slice(2);
+ const IS_DIR_ONLY = args.includes('--dir');
+ const SKIP_BUILD = args.includes('--skip-build');
++const IS_PUBLISH = args.includes('--publish');
+ 
+ function logStep(step, message) {
+   console.log(`\n======================================================`);
+@@ -76,7 +76,9 @@ console.log('Clean complete.');
+ if (SKIP_BUILD && existsSync(join(STANDALONE_DIR, 'server.js'))) {
+   logStep('2/6', 'Skipping Next.js build (--skip-build set and server.js exists)');
+ } else {
+-  logStep('2/6', 'Building Next.js application (standalone)...');
++  logStep('2/6', 'Building plugins and Next.js application (standalone)...');
++  runNode(join(ROOT_DIR, 'scripts', 'build-core-plugins.mjs'));
++  runNode(join(ROOT_DIR, 'scripts', 'build-plugin-authoring.mjs'));
+   runNode(NEXT_CLI, ['build']);
+ }
+ 
+@@ -99,6 +101,9 @@ const builderArgs = ['--win', '--x64'];
+ if (IS_DIR_ONLY) {
+   builderArgs.push('--dir');
+ }
++if (IS_PUBLISH) {
++  builderArgs.push('--publish', 'always', '-c.publish.releaseType=release');
++}
+ 
+ runNode(BUILDER_CLI, builderArgs);
+ 
+diff --git a/scripts/patch-sync.mjs b/scripts/patch-sync.mjs
+index a46a3c0..7f6fcd0 100644
+--- a/scripts/patch-sync.mjs
++++ b/scripts/patch-sync.mjs
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env node
+-import { existsSync, readdirSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
+-import { resolve, join } from 'node:path';
++import { existsSync, readdirSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
++import { resolve, join, basename } from 'node:path';
+ import { spawnSync, execSync } from 'node:child_process';
+ 
+ const ROOT_DIR = process.cwd();
+@@ -241,6 +241,14 @@ function cmdSync(options = {}) {
+     return;
+   }
+ 
++  // Backup patches in memory before git reset --hard deletes tracked patches/ from working tree
++  const savedPatches = patches.map((p) => ({
++    name: basename(p),
++    content: readFileSync(p),
++  }));
++  const readmePath = join(PATCHES_DIR, 'README.md');
++  const savedReadme = existsSync(readmePath) ? readFileSync(readmePath) : null;
++
+   // 3. Checkout or update target branch
+   const current = getCurrentBranch();
+   const syncBranchName = targetBranch || current;
+@@ -253,8 +261,23 @@ function cmdSync(options = {}) {
+   // Reset target branch to upstream
+   runGit(['reset', '--hard', `${remote}/${upstreamBranch}`]);
+ 
++  // Restore patches so git am --3way can apply them
++  mkdirSync(PATCHES_DIR, { recursive: true });
++  for (const p of savedPatches) {
++    writeFileSync(join(PATCHES_DIR, p.name), p.content);
++  }
++  if (savedReadme) {
++    writeFileSync(readmePath, savedReadme);
++  }
++
+   // 4. Apply patches
+   cmdApply();
++
++  // 5. Refresh patches/ from newly applied commits
++  cmdExport(`${remote}/${upstreamBranch}`);
++  if (savedReadme && !existsSync(readmePath)) {
++    writeFileSync(readmePath, savedReadme);
++  }
+ }
+ 
+ function printConflictHelp() {
+-- 
+2.53.0.windows.1
+

@@ -1,0 +1,142 @@
+From afe19f9403fb685c51bec664057f149397fa6354 Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Mon, 2 Nov 2026 11:45:07 +0800
+Subject: [PATCH 07/12] feat(desktop): add dedicated Windows packaging script
+ and npm scripts
+
+---
+ package.json                  |   2 +
+ scripts/build-desktop-win.mjs | 108 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 110 insertions(+)
+ create mode 100644 scripts/build-desktop-win.mjs
+
+diff --git a/package.json b/package.json
+index b534640..e0a0dc2 100644
+--- a/package.json
++++ b/package.json
+@@ -25,6 +25,8 @@
+ 		"desktop:dev": "concurrently -k \"npm run dev\" \"LH_DEV_URL=http://localhost:3000 electron .\"",
+ 		"dev:fresh": "bash scripts/dev-fresh.sh",
+ 		"desktop:dist": "rm -rf dist .next/standalone && npm run build && node scripts/smoke-provider-runtime.mjs && node scripts/build-server.mjs && node scripts/smoke-server.mjs && DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer} APPLE_KEYCHAIN_PROFILE=LH_NOTARY APPLE_TEAM_ID=JS6XN22HY6 electron-builder --mac --arm64",
++		"desktop:dist:win": "node scripts/build-desktop-win.mjs",
++		"desktop:dist:win:dir": "node scripts/build-desktop-win.mjs --dir",
+ 		"patch:export": "node scripts/patch-sync.mjs export",
+ 		"patch:sync": "node scripts/patch-sync.mjs sync",
+ 		"patch:apply": "node scripts/patch-sync.mjs apply",
+diff --git a/scripts/build-desktop-win.mjs b/scripts/build-desktop-win.mjs
+new file mode 100644
+index 0000000..406f708
+--- /dev/null
++++ b/scripts/build-desktop-win.mjs
+@@ -0,0 +1,108 @@
++#!/usr/bin/env node
++/**
++ * build-desktop-win.mjs — Dedicated Windows Desktop Packager for LearnHarness.
++ *
++ * Produces:
++ *   - dist/LearnHarness-0.4.1-x64-setup.exe (NSIS 1-click installer)
++ *   - Or unpacked application directory via --dir
++ *
++ * Steps:
++ *   1. Clean dist/ and .next/standalone
++ *   2. Build Next.js in standalone mode (next build)
++ *   3. Smoke-test provider runtime (scripts/smoke-provider-runtime.mjs)
++ *   4. Curate server standalone payload (scripts/build-server.mjs)
++ *   5. Smoke-test standalone server boot (scripts/smoke-server.mjs)
++ *   6. Package Windows desktop app with electron-builder
++ */
++
++import { rmSync, existsSync } from 'node:fs';
++import { resolve, join } from 'node:path';
++import { spawnSync } from 'node:child_process';
++import { createRequire } from 'node:module';
++
++const require = createRequire(import.meta.url);
++const ROOT_DIR = resolve(import.meta.dirname, '..');
++const DIST_DIR = join(ROOT_DIR, 'dist');
++const STANDALONE_DIR = join(ROOT_DIR, '.next', 'standalone');
++
++const NEXT_CLI = require.resolve('next/dist/bin/next');
++const BUILDER_CLI = require.resolve('electron-builder/cli.js');
++
++const args = process.argv.slice(2);
++const IS_DIR_ONLY = args.includes('--dir');
++const SKIP_BUILD = args.includes('--skip-build');
++
++function logStep(step, message) {
++  console.log(`\n======================================================`);
++  console.log(`  [Windows Desktop Build] Step ${step}: ${message}`);
++  console.log(`======================================================\n`);
++}
++
++function runNode(scriptPath, cmdArgs = [], envExtra = {}) {
++  const relativeScript = scriptPath.startsWith(ROOT_DIR)
++    ? scriptPath.replace(ROOT_DIR, '').replace(/^[\\/]/, '')
++    : scriptPath;
++
++  console.log(`> node ${relativeScript} ${cmdArgs.join(' ')}`);
++  const res = spawnSync(process.execPath, [scriptPath, ...cmdArgs], {
++    cwd: ROOT_DIR,
++    stdio: 'inherit',
++    env: {
++      ...process.env,
++      ...envExtra,
++    },
++    windowsHide: true,
++  });
++
++  if (res.status !== 0) {
++    console.error(`\n❌ Step failed with exit code ${res.status}: ${relativeScript} ${cmdArgs.join(' ')}`);
++    process.exit(res.status ?? 1);
++  }
++}
++
++// 1. Clean previous build artifacts
++logStep('1/6', 'Cleaning previous build directories...');
++if (existsSync(DIST_DIR)) {
++  console.log(`Removing ${DIST_DIR}...`);
++  rmSync(DIST_DIR, { recursive: true, force: true });
++}
++if (existsSync(STANDALONE_DIR)) {
++  console.log(`Removing ${STANDALONE_DIR}...`);
++  rmSync(STANDALONE_DIR, { recursive: true, force: true });
++}
++console.log('Clean complete.');
++
++// 2. Next.js standalone build
++if (SKIP_BUILD && existsSync(join(STANDALONE_DIR, 'server.js'))) {
++  logStep('2/6', 'Skipping Next.js build (--skip-build set and server.js exists)');
++} else {
++  logStep('2/6', 'Building Next.js application (standalone)...');
++  runNode(NEXT_CLI, ['build']);
++}
++
++// 3. Smoke check provider runtime
++logStep('3/6', 'Smoke checking provider runtime...');
++runNode(join(ROOT_DIR, 'scripts', 'smoke-provider-runtime.mjs'));
++
++// 4. Curate standalone server payload
++logStep('4/6', 'Curating standalone server payload...');
++runNode(join(ROOT_DIR, 'scripts', 'build-server.mjs'));
++
++// 5. Smoke check standalone server
++logStep('5/6', 'Smoke booting packaged server...');
++runNode(join(ROOT_DIR, 'scripts', 'smoke-server.mjs'));
++
++// 6. Electron-builder packaging for Windows
++logStep('6/6', `Packaging Windows desktop app (${IS_DIR_ONLY ? 'unpacked directory' : 'NSIS setup installer'})...`);
++
++const builderArgs = ['--win', '--x64'];
++if (IS_DIR_ONLY) {
++  builderArgs.push('--dir');
++}
++
++runNode(BUILDER_CLI, builderArgs);
++
++console.log(`\n======================================================`);
++console.log(`  🎉 Windows Desktop App Build Completed Successfully!`);
++console.log(`  Output artifacts located in: ${DIST_DIR}`);
++console.log(`======================================================\n`);
+-- 
+2.53.0.windows.1
+

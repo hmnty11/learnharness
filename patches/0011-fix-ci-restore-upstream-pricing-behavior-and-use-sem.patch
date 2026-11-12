@@ -1,0 +1,40 @@
+From 7d45fe6f52c4bf8788b657fad062d4cd7703341a Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Thu, 12 Nov 2026 09:16:52 +0800
+Subject: [PATCH 11/12] fix(ci): restore upstream pricing behavior and use
+ semantic error token in agent section
+
+---
+ components/settings/agent-section.tsx | 2 +-
+ src/server/pricing.ts                 | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/components/settings/agent-section.tsx b/components/settings/agent-section.tsx
+index 1742941..b84e1fc 100644
+--- a/components/settings/agent-section.tsx
++++ b/components/settings/agent-section.tsx
+@@ -565,7 +565,7 @@ export function AgentSection({
+ 								type="button"
+ 								data-testid={`delete-skill-${info.path}`}
+ 								onClick={() => void deleteSegment(info.path)}
+-								className="text-xs text-muted-foreground/70 underline-offset-2 hover:text-red-500 hover:underline"
++								className="text-xs text-muted-foreground/70 underline-offset-2 hover:text-error hover:underline"
+ 							>
+ 								Delete
+ 							</button>
+diff --git a/src/server/pricing.ts b/src/server/pricing.ts
+index b6b28cd..097669c 100644
+--- a/src/server/pricing.ts
++++ b/src/server/pricing.ts
+@@ -13,7 +13,7 @@ function catalogModel(id: string) {
+ 	const colon = id.indexOf(":");
+ 	// Native CLI routing determines billing. Adapter zero-rate placeholders
+ 	// must never become an apparent $0 estimate or subscription classification.
+-	if (colon < 0 || isSubscriptionModel(id) || [CLAUDE_CODE_PROVIDER, CUSTOM_PROVIDER.id, "9router"].includes(id.slice(0, colon))) return undefined;
++	if (colon < 0 || isSubscriptionModel(id) || [CLAUDE_CODE_PROVIDER, CUSTOM_PROVIDER.id].includes(id.slice(0, colon))) return undefined;
+ 	return piModels().getModel(id.slice(0, colon), id.slice(colon + 1));
+ }
+ 
+-- 
+2.53.0.windows.1
+

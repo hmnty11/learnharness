@@ -1,0 +1,81 @@
+From 97b0dda3da06416bf48dd9165b819e9561db7c00 Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Thu, 12 Nov 2026 08:57:32 +0800
+Subject: [PATCH 10/12] fix(providers): exclude 9router from zero-cost estimate
+ and honor fresh-user policy
+
+---
+ src/agent/9router-provider.ts |  2 +-
+ src/server/pricing.ts         |  2 +-
+ tests/9router.test.ts         | 15 +++++++--------
+ 3 files changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/src/agent/9router-provider.ts b/src/agent/9router-provider.ts
+index 4d39471..7d3243b 100644
+--- a/src/agent/9router-provider.ts
++++ b/src/agent/9router-provider.ts
+@@ -44,7 +44,7 @@ export function resolveLocal9RouterKey(): string | undefined {
+ }
+ 
+ export function nineRouterApiKey(): string | undefined {
+-	if (process.env.LH_IGNORE_ENV_KEYS === "1") return process.env.NINEROUTER_API_KEY || undefined;
++	if (process.env.LH_IGNORE_ENV_KEYS === "1") return undefined;
+ 	return process.env.NINEROUTER_API_KEY || resolveLocal9RouterKey();
+ }
+ 
+diff --git a/src/server/pricing.ts b/src/server/pricing.ts
+index 097669c..b6b28cd 100644
+--- a/src/server/pricing.ts
++++ b/src/server/pricing.ts
+@@ -13,7 +13,7 @@ function catalogModel(id: string) {
+ 	const colon = id.indexOf(":");
+ 	// Native CLI routing determines billing. Adapter zero-rate placeholders
+ 	// must never become an apparent $0 estimate or subscription classification.
+-	if (colon < 0 || isSubscriptionModel(id) || [CLAUDE_CODE_PROVIDER, CUSTOM_PROVIDER.id].includes(id.slice(0, colon))) return undefined;
++	if (colon < 0 || isSubscriptionModel(id) || [CLAUDE_CODE_PROVIDER, CUSTOM_PROVIDER.id, "9router"].includes(id.slice(0, colon))) return undefined;
+ 	return piModels().getModel(id.slice(0, colon), id.slice(colon + 1));
+ }
+ 
+diff --git a/tests/9router.test.ts b/tests/9router.test.ts
+index 57d1cec..d8987eb 100644
+--- a/tests/9router.test.ts
++++ b/tests/9router.test.ts
+@@ -1,7 +1,7 @@
+ import { describe, it } from "node:test";
+ import assert from "node:assert/strict";
+-import { catalogProviders, modelCatalog, validateChatSettings, validateModelsSettings } from "../src/server/model-catalog.ts";
+-import { isWritableAuthKey, keyStatuses, providerKeyList } from "../src/server/keys.ts";
++import { catalogProviders, validateChatSettings, validateModelsSettings } from "../src/server/model-catalog.ts";
++import { isWritableAuthKey, providerKeyList, resolveKeyStatuses } from "../src/server/keys.ts";
+ import { piModels, piEngineForSpec } from "../src/agent/models.ts";
+ 
+ describe("9router integration", () => {
+@@ -18,9 +18,8 @@ describe("9router integration", () => {
+ 		assert.equal(typeof p9?.keyPresent, "boolean");
+ 	});
+ 
+-	it("modelCatalog exposes 9router models", () => {
+-		const catalog = modelCatalog();
+-		const ninerouterModels = catalog.models.filter((m) => m.provider === "9router");
++	it("piModels() exposes 9router baseline models", () => {
++		const ninerouterModels = piModels().getModels("9router");
+ 		assert.ok(ninerouterModels.length > 0, "has 9router models");
+ 		const gemini = ninerouterModels.find((m) => m.id === "gemini/gemini-3.8-flash");
+ 		assert.ok(gemini, "gemini-3.8-flash is present in 9router catalog");
+@@ -60,10 +59,10 @@ describe("9router integration", () => {
+ 		assert.equal(isWritableAuthKey("NINEROUTER_API_KEY"), true);
+ 	});
+ 
+-	it("keyStatuses returns NINEROUTER_API_KEY status row", () => {
+-		const statuses = keyStatuses();
++	it("keyStatuses handles NINEROUTER_API_KEY when key is present", () => {
++		const statuses = resolveKeyStatuses({ NINEROUTER_API_KEY: "sk-9router-test-key" }, {}, new Set(), new Set(["NINEROUTER_API_KEY"]));
+ 		const row = statuses.find((s) => s.id === "NINEROUTER_API_KEY");
+ 		assert.ok(row, "NINEROUTER_API_KEY status row exists");
+-		assert.equal(typeof row?.present, "boolean");
++		assert.equal(row?.present, true);
+ 	});
+ });
+-- 
+2.53.0.windows.1
+
