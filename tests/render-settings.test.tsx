@@ -60,6 +60,7 @@ describe("SettingsDialog (the designed surface, SSR)", () => {
 			["appearance", "Appearance", "palette"],
 			["graph", "Graph", "waypoints"],
 			["keyboard", "Keyboard", "keyboard"],
+			["sync", "Sync", "refresh-cw"],
 			["general", "General", "settings"],
 			["core-plugins", "Core plugins", "plug"],
 			["plugins", "Community plugins", "puzzle"],
@@ -90,7 +91,7 @@ describe("SettingsDialog (the designed surface, SSR)", () => {
 		assert.ok(html.includes('role="dialog"'));
 		assert.ok(html.includes('aria-modal="true"'));
 		assert.ok(html.includes('aria-label="Close settings"'));
-		for (const id of ["general", "keys", "agent", "appearance", "graph", "keyboard"]) {
+		for (const id of ["general", "keys", "agent", "appearance", "graph", "keyboard", "sync"]) {
 			assert.ok(html.includes(`data-testid="settings-nav-${id}"`), id);
 		}
 		// Providers is the first landing section; internal keys deep links survive.

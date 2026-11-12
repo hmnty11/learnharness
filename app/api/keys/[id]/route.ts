@@ -15,8 +15,7 @@
  * MODEL-PROVIDER env vars (provider-keys interlude); anything else is 404
  * — unknown file vars are preserved, not editable.
  */
-import { isWritableAuthKey } from "@/src/server";
-import { deleteKey, saveKey } from "@/src/server";
+import { isWritableAuthKey, deleteKey, saveKey, triggerAutoSync } from "@/src/server";
 
 export const dynamic = "force-dynamic";
 
@@ -38,6 +37,7 @@ export async function PUT(req: Request, { params }: Params) {
 	}
 	const result = saveKey(id, (body as { value: string }).value);
 	if (!result.ok) return Response.json({ error: result.error }, { status: 400 });
+	triggerAutoSync();
 	return Response.json({ status: result.status });
 }
 
@@ -46,5 +46,7 @@ export async function DELETE(_req: Request, { params }: Params) {
 	if (!isWritableAuthKey(id)) {
 		return Response.json({ error: `unknown key "${id}"` }, { status: 404 });
 	}
-	return Response.json({ status: deleteKey(id) });
+	const status = deleteKey(id);
+	triggerAutoSync();
+	return Response.json({ status });
 }

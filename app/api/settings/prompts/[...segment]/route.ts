@@ -31,6 +31,8 @@ import {
 	isValidSegmentPath,
 	promptOverrides,
 	readSettingsRecord,
+	recordPromptDeleted,
+	triggerAutoSync,
 	writeSettingsRecord,
 } from "@/src/server";
 
@@ -58,6 +60,7 @@ export async function PUT(request: Request, ctx: { params: Promise<{ segment: st
 		);
 	}
 	promptOverrides.writeOverride(path, body.text);
+	triggerAutoSync();
 	return Response.json({ path, text: body.text });
 }
 
@@ -75,6 +78,8 @@ export async function DELETE(_request: Request, ctx: { params: Promise<{ segment
 		writeSettingsRecord({ ...record, agent: { ...record.agent, prompts } });
 	}
 	promptOverrides.deleteOverride(path);
+	recordPromptDeleted(path);
+	triggerAutoSync();
 	// switchCleared tells the caller their on-switch went off WITH the file
 	// (additive; the GET view derives the same truth from record+file).
 	return Response.json({ path, deleted: true, switchCleared: hadSwitch });

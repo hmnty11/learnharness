@@ -75,7 +75,7 @@ afterEach(async () => { await act(async () => root?.unmount()); host?.remove(); 
 test("Providers is the first/default page; General closes the native group before Core/Community plugins", () => {
  const html = renderToStaticMarkup(<SettingsDialogBody onClose={() => {}} />);
  const ids = [...html.matchAll(/data-testid="settings-nav-([^"]+)"/g)].map((m) => m[1]);
- assert.deepEqual(ids, ["keys", "agent", "appearance", "graph", "keyboard", "general", "core-plugins", "plugins"]);
+ assert.deepEqual(ids, ["keys", "agent", "appearance", "graph", "keyboard", "sync", "general", "core-plugins", "plugins"]);
  assert.match(html, /settings-nav-keys[^>]*aria-current="true"/);
  assert.equal(parseHTML(html).document.querySelector('[data-testid="settings-nav-keys"]')?.textContent, "Providers");
 });

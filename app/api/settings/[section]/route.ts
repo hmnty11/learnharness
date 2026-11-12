@@ -45,6 +45,7 @@ import {
 	validateChatSettings,
 	validateModelsSettings,
 	writeSettingsRecord,
+	triggerAutoSync,
 	type SettingsBodyResult,
 } from "@/src/server";
 
@@ -148,6 +149,7 @@ export async function PUT(request: Request, ctx: { params: Promise<{ section: st
 	// Only a successful durable write changes admission. Increasing the
 	// limit immediately drains queued requests; decreasing never cancels active work.
 	refreshWorkerRequestAdmission();
+	triggerAutoSync();
 	const fileAccessError = fileAccessConfigurationError();
 	return Response.json({ settings: stored, ...(fileAccessError ? { fileAccessError } : {}) });
 }

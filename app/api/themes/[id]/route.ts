@@ -6,7 +6,7 @@
  */
 
 import { isBuiltinThemeId } from "@/src/core";
-import { readSettingsRecord, themeStore, writeSettingsRecord } from "@/src/server";
+import { readSettingsRecord, recordThemeDeleted, themeStore, triggerAutoSync, writeSettingsRecord } from "@/src/server";
 
 export const dynamic = "force-dynamic";
 
@@ -16,6 +16,8 @@ export async function DELETE(_request: Request, ctx: { params: Promise<{ id: str
 	const theme = themeStore.readTheme(id);
 	if (!theme) return Response.json({ error: `unknown theme "${id}"` }, { status: 404 });
 	themeStore.deleteTheme(id);
+	recordThemeDeleted(id);
+	triggerAutoSync();
 	const record = readSettingsRecord();
 	if (record?.appearance?.theme === id) {
 		writeSettingsRecord({ ...record, appearance: { ...record.appearance, theme: "default" } });

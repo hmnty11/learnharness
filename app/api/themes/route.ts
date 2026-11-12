@@ -10,7 +10,7 @@
  */
 
 import { BUILTIN_THEMES, isBuiltinThemeId, isThemeId, parseThemeFile, themeIdFromName } from "@/src/core";
-import { themeStore } from "@/src/server";
+import { themeStore, triggerAutoSync } from "@/src/server";
 
 export const dynamic = "force-dynamic";
 
@@ -32,5 +32,6 @@ export async function POST(request: Request) {
 	}
 	if (!isThemeId(id)) return Response.json({ error: "name must produce a valid theme id" }, { status: 400 });
 	themeStore.writeTheme(id, parsed.theme);
+	triggerAutoSync();
 	return Response.json({ theme: { ...parsed.theme, id, builtin: false } }, { status: 201 });
 }

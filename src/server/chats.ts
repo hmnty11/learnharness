@@ -9,6 +9,7 @@ import { isTurnRunning } from "./turn-liveness.ts";
 import { clearTurnFailure } from "./turn-runs.ts";
 import { discardChatDeliveries } from "./jobs.ts";
 import { sideChats } from "./side-chat.ts";
+import { recordChatDeleted } from "./sync.ts";
 
 /**
  * Server-side chat entries for the transport layer (app/api/chats*,
@@ -151,6 +152,7 @@ function finishChatDeletion(chatId: string, mode: ChatDeleteMode): Extract<ChatD
 function finishChatRecordDeletion(chatId: string): number {
 	const jobsRemoved = stores.jobStore.deleteJobsForChat(chatId);
 	if (stores.chatStore.deleteChat(chatId)) {
+		recordChatDeleted(chatId);
 		discardChatDeliveries(chatId);
 		clearTurnFailure(chatId);
 		sideChats.stopAll(chatId); // a running side answer has nowhere left to land
