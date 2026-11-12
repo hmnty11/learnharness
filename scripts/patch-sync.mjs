@@ -86,7 +86,7 @@ function cmdExport(baseArg) {
   }
 
   // Count commits ahead
-  const count = getGitOutput(['rev-list', '--count', `${base}..HEAD`]);
+  const count = getGitOutput(['rev-list', '--count', `${base}..HEAD`, '--', '.', ':!patches']);
   if (!count || parseInt(count, 10) === 0) {
     console.warn(`⚠️ No commits found between ${base} and HEAD. Nothing to export.`);
     return;
@@ -97,7 +97,7 @@ function cmdExport(baseArg) {
   cleanPatchesDir();
 
   try {
-    runGit(['format-patch', `${base}..HEAD`, '-o', 'patches']);
+    runGit(['format-patch', `${base}..HEAD`, '-o', 'patches', '--', '.', ':!patches']);
   } catch (err) {
     console.error(`❌ Failed to export patches:`, err.message);
     process.exit(1);
@@ -202,7 +202,7 @@ function cmdStatus() {
   } else {
     console.log(`   No git am session active.`);
     const remote = getDefaultBaseRemote();
-    const ahead = getGitOutput(['rev-list', '--count', `${remote}/main..HEAD`], true);
+    const ahead = getGitOutput(['rev-list', '--count', `${remote}/main..HEAD`, '--', '.', ':!patches'], true);
     if (ahead) {
       console.log(`   Commits ahead of ${remote}/main: ${ahead}`);
     }

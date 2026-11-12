@@ -59,7 +59,7 @@ jobs:
               git commit -m "chore(patches): refresh patches against upstream" || true
             fi
             echo "Pushing synced main branch to origin/main..."
-            git push origin main
+            git push --force-with-lease origin main
           else
             echo "Fork main is already up to date with upstream/main."
           fi
@@ -74,20 +74,23 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-          EXISTS="false"
-          if gh release view "$TAG" --repo hmnty11/learnharness >/dev/null 2>&1; then
-            IS_DRAFT=$(gh release view "$TAG" --repo hmnty11/learnharness --json isDraft -q .isDraft 2>/dev/null || echo "false")
-            if [ "$IS_DRAFT" = "false" ]; then
-              EXISTS="true"
-            fi
-          fi
+          RELEASES_JSON=$(gh release list --repo hmnty11/learnharness --limit 100 --json tagName,isDraft)
+          RELEASE_STATE=$(printf '%s' "$RELEASES_JSON" | TAG="$TAG" node -e '
+            const fs = require("node:fs");
+            const list = JSON.parse(fs.readFileSync(0, "utf8"));
+            const match = list.find((r) => r.tagName === process.env.TAG);
+            if (match) process.stdout.write(match.isDraft ? "draft" : "published");
+          ')
 
-          if [ "$EXISTS" = "false" ] || [ "$FORCE_RELEASE" = "true" ]; then
-            echo "Release $TAG needs to be built and published."
+          if [ "$RELEASE_STATE" != "published" ] || [ "$FORCE_RELEASE" = "true" ]; then
+            echo "Release $TAG needs to be built and published (state: ${RELEASE_STATE:-none}, force: $FORCE_RELEASE)."
             echo "should_release=true" >> "$GITHUB_OUTPUT"
-            if ! gh release view "$TAG" --repo hmnty11/learnharness >/dev/null 2>&1; then
+            if [ -z "$RELEASE_STATE" ]; then
               echo "Creating initial draft release $TAG on hmnty11/learnharness..."
               gh release create "$TAG" --repo hmnty11/learnharness --draft --title "LearnHarness $TAG (Patched)" --notes "LearnHarness $TAG with custom fork patches for hmnty11/learnharness."
+            elif [ "$RELEASE_STATE" = "published" ] && [ "$FORCE_RELEASE" = "true" ]; then
+              echo "Converting existing published release $TAG back to draft for asset re-upload..."
+              gh release edit "$TAG" --repo hmnty11/learnharness --draft=true
             fi
           else
             echo "Release $TAG is already published on hmnty11/learnharness. Skipping release build."
