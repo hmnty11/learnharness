@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { existsSync, readdirSync, rmSync, mkdirSync, readFileSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { existsSync, readdirSync, rmSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { resolve, join, basename } from 'node:path';
 import { spawnSync, execSync } from 'node:child_process';
 
 const ROOT_DIR = process.cwd();
@@ -241,6 +241,14 @@ function cmdSync(options = {}) {
     return;
   }
 
+  // Backup patches in memory before git reset --hard deletes tracked patches/ from working tree
+  const savedPatches = patches.map((p) => ({
+    name: basename(p),
+    content: readFileSync(p),
+  }));
+  const readmePath = join(PATCHES_DIR, 'README.md');
+  const savedReadme = existsSync(readmePath) ? readFileSync(readmePath) : null;
+
   // 3. Checkout or update target branch
   const current = getCurrentBranch();
   const syncBranchName = targetBranch || current;
@@ -253,8 +261,23 @@ function cmdSync(options = {}) {
   // Reset target branch to upstream
   runGit(['reset', '--hard', `${remote}/${upstreamBranch}`]);
 
+  // Restore patches so git am --3way can apply them
+  mkdirSync(PATCHES_DIR, { recursive: true });
+  for (const p of savedPatches) {
+    writeFileSync(join(PATCHES_DIR, p.name), p.content);
+  }
+  if (savedReadme) {
+    writeFileSync(readmePath, savedReadme);
+  }
+
   // 4. Apply patches
   cmdApply();
+
+  // 5. Refresh patches/ from newly applied commits
+  cmdExport(`${remote}/${upstreamBranch}`);
+  if (savedReadme && !existsSync(readmePath)) {
+    writeFileSync(readmePath, savedReadme);
+  }
 }
 
 function printConflictHelp() {

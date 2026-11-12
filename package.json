@@ -27,6 +27,7 @@
 		"desktop:dist": "rm -rf dist .next/standalone && npm run build && node scripts/smoke-provider-runtime.mjs && node scripts/build-server.mjs && node scripts/smoke-server.mjs && DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer} APPLE_KEYCHAIN_PROFILE=LH_NOTARY APPLE_TEAM_ID=JS6XN22HY6 electron-builder --mac --arm64",
 		"desktop:dist:win": "node scripts/build-desktop-win.mjs",
 		"desktop:dist:win:dir": "node scripts/build-desktop-win.mjs --dir",
+		"desktop:release:win": "node scripts/build-desktop-win.mjs --publish",
 		"patch:export": "node scripts/patch-sync.mjs export",
 		"patch:sync": "node scripts/patch-sync.mjs sync",
 		"patch:apply": "node scripts/patch-sync.mjs apply",

@@ -1,0 +1,185 @@
+name: Fork Sync & Patched Desktop Release
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: "Force build and release even if version tag already exists"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-sync-release
+  cancel-in-progress: false
+
+env:
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  sync-and-check:
+    name: Sync upstream & check release
+    if: github.repository == 'hmnty11/learnharness'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Fetch upstream and tags
+        run: |
+          git remote add upstream https://github.com/amosblomqvist/learnharness.git || git remote set-url upstream https://github.com/amosblomqvist/learnharness.git
+          git fetch upstream main --tags
+      - name: Sync with upstream if new commits exist
+        run: |
+          if ! git merge-base --is-ancestor upstream/main HEAD; then
+            echo "New upstream commits detected! Running patch:sync..."
+            npm ci
+            npm run patch:sync
+            if [ -d "patches" ]; then
+              git add patches/
+              git commit -m "chore(patches): refresh patches against upstream" || true
+            fi
+            echo "Pushing synced main branch to origin/main..."
+            git push origin main
+          else
+            echo "Fork main is already up to date with upstream/main."
+          fi
+      - name: Check version and release status
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_RELEASE: ${{ inputs.force_release }}
+        run: |
+          VERSION=$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          EXISTS="false"
+          if gh release view "$TAG" --repo hmnty11/learnharness >/dev/null 2>&1; then
+            IS_DRAFT=$(gh release view "$TAG" --repo hmnty11/learnharness --json isDraft -q .isDraft 2>/dev/null || echo "false")
+            if [ "$IS_DRAFT" = "false" ]; then
+              EXISTS="true"
+            fi
+          fi
+
+          if [ "$EXISTS" = "false" ] || [ "$FORCE_RELEASE" = "true" ]; then
+            echo "Release $TAG needs to be built and published."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            if ! gh release view "$TAG" --repo hmnty11/learnharness >/dev/null 2>&1; then
+              echo "Creating initial draft release $TAG on hmnty11/learnharness..."
+              gh release create "$TAG" --repo hmnty11/learnharness --draft --title "LearnHarness $TAG (Patched)" --notes "LearnHarness $TAG with custom fork patches for hmnty11/learnharness."
+            fi
+          else
+            echo "Release $TAG is already published on hmnty11/learnharness. Skipping release build."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  package:
+    name: Package (${{ matrix.platform }})
+    needs: sync-and-check
+    if: needs.sync-and-check.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            platform: windows-x64
+            builder_args: --win --x64
+          - os: ubuntu-24.04
+            platform: linux-x64
+            builder_args: --linux --x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+      - run: npm ci
+      - run: npm run plugins:setup
+      - name: Native renderer tests on this OS
+        run: npx electron --import tsx --test tests/pdf-native-render.test.ts tests/pdf-ops.test.ts tests/svg-native-render.test.ts tests/browser-service.test.ts
+        env:
+          NODE_ENV: test
+          ELECTRON_RUN_AS_NODE: "1"
+      - run: npm run build
+      - run: node scripts/smoke-provider-runtime.mjs
+      - run: node scripts/build-server.mjs
+      - run: node scripts/smoke-server.mjs --electron
+      - name: Package desktop app and upload to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder ${{ matrix.builder_args }} --publish always
+      - name: Initialize packaged providers offline
+        run: |
+          case "$RUNNER_OS" in
+            Windows)
+              payload="dist/win-unpacked/resources/server/standalone"
+              runtime="dist/win-unpacked/LearnHarness.exe"
+              ;;
+            Linux)
+              payload="dist/linux-unpacked/resources/server/standalone"
+              runtime="dist/linux-unpacked/learnharness"
+              ;;
+          esac
+          node scripts/smoke-provider-runtime.mjs --standalone "$payload"
+          node scripts/smoke-provider-runtime.mjs --standalone "$payload" --runtime "$runtime"
+      - name: Save installers and update metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: learnharness-fork-${{ matrix.platform }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            dist/*.exe
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.blockmap
+            dist/latest*.yml
+
+  publish:
+    name: Publish release to GitHub
+    needs: [sync-and-check, package]
+    if: needs.sync-and-check.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Publish draft release on hmnty11/learnharness
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.sync-and-check.outputs.tag }}
+        run: |
+          echo "Publishing release $TAG on hmnty11/learnharness..."
+          gh release edit "$TAG" --repo hmnty11/learnharness --draft=false --latest
+          echo "Successfully published $TAG! Desktop clients pointing to hmnty11/learnharness will now auto-update."

@@ -8,8 +8,7 @@
  *
  * Steps:
  *   1. Clean dist/ and .next/standalone
- *   2. Build Next.js in standalone mode (next build)
- *   3. Smoke-test provider runtime (scripts/smoke-provider-runtime.mjs)
+ *   2. Build plugins & Next.js in standalone mode
  *   4. Curate server standalone payload (scripts/build-server.mjs)
  *   5. Smoke-test standalone server boot (scripts/smoke-server.mjs)
  *   6. Package Windows desktop app with electron-builder
@@ -31,6 +30,7 @@ const BUILDER_CLI = require.resolve('electron-builder/cli.js');
 const args = process.argv.slice(2);
 const IS_DIR_ONLY = args.includes('--dir');
 const SKIP_BUILD = args.includes('--skip-build');
+const IS_PUBLISH = args.includes('--publish');
 
 function logStep(step, message) {
   console.log(`\n======================================================`);
@@ -76,7 +76,9 @@ console.log('Clean complete.');
 if (SKIP_BUILD && existsSync(join(STANDALONE_DIR, 'server.js'))) {
   logStep('2/6', 'Skipping Next.js build (--skip-build set and server.js exists)');
 } else {
-  logStep('2/6', 'Building Next.js application (standalone)...');
+  logStep('2/6', 'Building plugins and Next.js application (standalone)...');
+  runNode(join(ROOT_DIR, 'scripts', 'build-core-plugins.mjs'));
+  runNode(join(ROOT_DIR, 'scripts', 'build-plugin-authoring.mjs'));
   runNode(NEXT_CLI, ['build']);
 }
 
@@ -98,6 +100,9 @@ logStep('6/6', `Packaging Windows desktop app (${IS_DIR_ONLY ? 'unpacked directo
 const builderArgs = ['--win', '--x64'];
 if (IS_DIR_ONLY) {
   builderArgs.push('--dir');
+}
+if (IS_PUBLISH) {
+  builderArgs.push('--publish', 'always', '-c.publish.releaseType=release');
 }
 
 runNode(BUILDER_CLI, builderArgs);
