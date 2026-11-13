@@ -1,7 +1,7 @@
 From fadceb0378d99d58120bdaf105855411a3c385f0 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Fri, 13 Nov 2026 11:15:32 +0800
-Subject: [PATCH 14/16] feat(import): add MarkItDown docx/pdf conversion and
+Subject: [PATCH 14/17] feat(import): add MarkItDown docx/pdf conversion and
  Baidu unlimited OCR for PDF
 
 ---

@@ -1,7 +1,7 @@
 From b259f4bd4b1836b0526bd3c4fd465dbdd1f353b1 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Fri, 13 Nov 2026 15:27:35 +0800
-Subject: [PATCH 16/16] feat(extraction): add AST-aware chunking, header/footer
+Subject: [PATCH 16/17] feat(extraction): add AST-aware chunking, header/footer
  cleaner, auditor short-circuit, and Baidu OCR toggle
 
 ---

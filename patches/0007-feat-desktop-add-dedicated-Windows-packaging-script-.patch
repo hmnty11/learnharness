@@ -1,7 +1,7 @@
 From afe19f9403fb685c51bec664057f149397fa6354 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Mon, 2 Nov 2026 11:45:07 +0800
-Subject: [PATCH 07/16] feat(desktop): add dedicated Windows packaging script
+Subject: [PATCH 07/17] feat(desktop): add dedicated Windows packaging script
  and npm scripts
 
 ---

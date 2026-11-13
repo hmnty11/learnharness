@@ -1,7 +1,7 @@
 From dab7e19de16fdebd7aac33f66c2570d4d9178723 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 12 Nov 2026 08:52:12 +0800
-Subject: [PATCH 09/16] fix(tooling): prevent nested patches, fix fork-sync
+Subject: [PATCH 09/17] fix(tooling): prevent nested patches, fix fork-sync
  push/force-release, and make 9router test hermetic
 
 ---

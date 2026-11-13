@@ -1,7 +1,7 @@
 From 1cf9fb9fa6a7394134cdeaa20405d5353777c0eb Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Fri, 13 Nov 2026 14:01:22 +0800
-Subject: [PATCH 15/16] fix(workflow): force tag fetch in fork sync to prevent
+Subject: [PATCH 15/17] fix(workflow): force tag fetch in fork sync to prevent
  clobber rejection
 
 ---

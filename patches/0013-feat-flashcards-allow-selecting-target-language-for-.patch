@@ -1,7 +1,7 @@
 From eab8154079515d5d4ab3f4a68dd42e45ed4eac93 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Fri, 13 Nov 2026 10:10:12 +0800
-Subject: [PATCH 13/16] feat(flashcards): allow selecting target language for
+Subject: [PATCH 13/17] feat(flashcards): allow selecting target language for
  card generation
 
 ---

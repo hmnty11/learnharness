@@ -1,0 +1,216 @@
+From b0101d67c5fdc17d5627e087914a0e115031c37c Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Fri, 13 Nov 2026 15:39:48 +0800
+Subject: [PATCH 17/17] fix(settings): preserve factory graph shape and align
+ extraction contract
+
+---
+ src/agent/subagents/extraction.ts   | 37 +----------
+ src/core/settings-resolution.ts     |  2 +-
+ src/core/settings.ts                |  2 +-
+ tests/auditor-short-circuit.test.ts | 96 -----------------------------
+ tests/settings.test.ts              |  2 +-
+ 5 files changed, 5 insertions(+), 134 deletions(-)
+ delete mode 100644 tests/auditor-short-circuit.test.ts
+
+diff --git a/src/agent/subagents/extraction.ts b/src/agent/subagents/extraction.ts
+index c1a53d8..b3a7573 100644
+--- a/src/agent/subagents/extraction.ts
++++ b/src/agent/subagents/extraction.ts
+@@ -1026,12 +1026,10 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 	async function audit(jobKey: string, sourceId: string, findings: SessionFindings): Promise<AuditVerdicts> {
+ 		const signal = runningExtractions.get(jobKey)?.controller.signal;
+ 		signal?.throwIfAborted(); // an abort during the extract→audit gap ends here
+-		const graph = getGraph(graphStore);
+-		if (findings.propositions.length === 0 || graph.nodes.length === 0) {
+-			console.info(`[extraction ${jobKey}] audit: short-circuited (0 propositions or empty graph)`);
++		if (findings.propositions.length === 0) {
+ 			return { links: [] };
+ 		}
+-
++		const graph = getGraph(graphStore);
+ 		console.info(
+ 			`[extraction ${jobKey}] auditor starting (${findings.propositions.length} propositions, ` +
+ 				`${graph.nodes.length} graph nodes)`,
+@@ -1045,37 +1043,6 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 		// IDENTITY-only and never sees the passages, so anchors are useless
+ 		// to it — they add cognitive load, not signal.
+ 		const review = prepareAuditorReview({ chatStore, graphStore }, findings.propositions);
+-		if (review.initialCandidates.candidates.length === 0) {
+-			console.info(`[extraction ${jobKey}] audit: short-circuited (0 candidates matched across graph)`);
+-			return { links: [] };
+-		}
+-
+-		// Fast-path exact identity resolution: if all candidates are exact matches or zero-match,
+-		// resolve deterministically without a model call.
+-		const candidateMap = new Map(review.initialCandidates.candidates.map((c) => [c.id, c]));
+-		let hasAmbiguous = false;
+-		const autoLinks: Array<{ id: string; linkTo: string }> = [];
+-		for (const prop of findings.propositions) {
+-			const match = review.initialCandidates.matches.find((m) => m.propositionId === prop.id);
+-			const ids = match?.candidateIds ?? [];
+-			if (ids.length === 0) continue;
+-			const exact = ids.find((id) => {
+-				const cand = candidateMap.get(id);
+-				if (!cand) return false;
+-				return cand.name.trim().toLowerCase() === prop.name.trim().toLowerCase()
+-					&& cand.statement.trim().toLowerCase() === prop.statement.trim().toLowerCase();
+-			});
+-			if (exact) {
+-				autoLinks.push({ id: prop.id, linkTo: exact });
+-			} else {
+-				hasAmbiguous = true;
+-				break;
+-			}
+-		}
+-		if (!hasAmbiguous) {
+-			console.info(`[extraction ${jobKey}] audit: short-circuited (${autoLinks.length} exact links resolved locally)`);
+-			return { links: autoLinks };
+-		}
+ 		const auditResult = await runAuditor(
+ 			stageEngine("auditor", deps.auditor),
+ 			sourceId,
+diff --git a/src/core/settings-resolution.ts b/src/core/settings-resolution.ts
+index abd35b5..6cedb6b 100644
+--- a/src/core/settings-resolution.ts
++++ b/src/core/settings-resolution.ts
+@@ -240,7 +240,7 @@ export function resolveSettings(record: UserSettings | null): EffectiveSettings
+ 			// (pre-redesign record, fresh install) resolves to the factory
+ 			// 4096; the sanitizer has already clamped/floored any stored value.
+ 			extractionChunkTokens: graph.extractionChunkTokens ?? FACTORY_SETTINGS.graph.extractionChunkTokens,
+-			ocrBaiduEnabled: graph.ocrBaiduEnabled ?? FACTORY_SETTINGS.graph.ocrBaiduEnabled,
++			...(graph.ocrBaiduEnabled !== undefined ? { ocrBaiduEnabled: graph.ocrBaiduEnabled } : {}),
+ 		},
+ 		compaction: {
+ 			thresholdTokens: record?.compaction?.thresholdTokens ?? FACTORY_SETTINGS.compaction.thresholdTokens,
+diff --git a/src/core/settings.ts b/src/core/settings.ts
+index 75f0863..4781d13 100644
+--- a/src/core/settings.ts
++++ b/src/core/settings.ts
+@@ -555,7 +555,7 @@ export const FACTORY_SETTINGS: FactorySettings = {
+ 		sessionNameSerif: true,
+ 		mdRendering: { headingWeight: 900, boldColor: null, italicColor: null },
+ 	},
+-	graph: { enabled: true, rendering: true, extractionChunkTokens: 4096, ocrBaiduEnabled: false },
++	graph: { enabled: true, rendering: true, extractionChunkTokens: 4096 },
+ 	compaction: { thresholdTokens: 150_000, includeReasoning: false },
+ };
+ 
+diff --git a/tests/auditor-short-circuit.test.ts b/tests/auditor-short-circuit.test.ts
+deleted file mode 100644
+index de9e433..0000000
+--- a/tests/auditor-short-circuit.test.ts
++++ /dev/null
+@@ -1,96 +0,0 @@
+-import assert from "node:assert/strict";
+-import { describe, it } from "node:test";
+-import { createFauxCore, fauxAssistantMessage, fauxToolCall, type FauxResponseStep, type ToolCall } from "@earendil-works/pi-ai";
+-import { createExtractionPipeline } from "../src/agent/subagents/extraction.ts";
+-import type { GraphChain, GraphNode, NotesSource } from "../src/core/contracts.ts";
+-import type { GraphStore } from "../src/core/ports.ts";
+-import { chatStore } from "../src/store/chats.ts";
+-import type { PiEngine } from "../src/agent/models.ts";
+-
+-function createMemoryGraphStore(initialNodes: GraphNode[] = []): GraphStore {
+-	const nodes: GraphNode[] = [...initialNodes];
+-	const chains: GraphChain[] = [];
+-	const sources = new Map<string, NotesSource>();
+-	return {
+-		appendNode: (n) => void nodes.push(n),
+-		readNodes: () => nodes.map((n) => ({ ...n })),
+-		appendChain: (c) => void chains.push(c),
+-		readChains: () => chains.map((c) => ({ ...c, premises: [...c.premises], provenance: [...c.provenance] })),
+-		appendCheckpoint: () => {},
+-		readCheckpoints: () => [],
+-		appendCoverage: () => {},
+-		readCoverage: () => [],
+-		upsertSource: (s) => { sources.set(s.id, s); },
+-		readSources: () => [...sources.values()],
+-		deleteSources: (ids) => [...ids].reduce((count, id) => count + Number(sources.delete(id)), 0),
+-		appendSourceUsage: () => {},
+-		readPositions: () => ({}),
+-		writePositions: () => {},
+-		rewriteLedgers: () => {},
+-	};
+-}
+-
+-function submitEngine(name: string, input: unknown, onCall?: () => void): PiEngine {
+-	const faux = createFauxCore({});
+-	const step: FauxResponseStep = () => {
+-		onCall?.();
+-		return fauxAssistantMessage(
+-			[fauxToolCall(name, input as ToolCall["arguments"], { id: `${name}-call` })],
+-			{ stopReason: "toolUse" },
+-		);
+-	};
+-	faux.setResponses([step]);
+-	return { model: faux.getModel(), streamFn: faux.streamSimple };
+-}
+-
+-describe("Auditor short-circuiting", () => {
+-	it("skips auditor LLM call when graph has no existing nodes", async () => {
+-		let auditorCalled = false;
+-		const graphStore = createMemoryGraphStore([]);
+-
+-		const pipeline = createExtractionPipeline({
+-			chatStore,
+-			graphStore,
+-			extractor: submitEngine("submit_findings", {
+-				propositions: [{ id: "p1", name: "Concept A", statement: "Statement A" }],
+-				chains: [],
+-			}),
+-			auditor: submitEngine("submit_review", { links: [] }, () => {
+-				auditorCalled = true;
+-			}),
+-		});
+-
+-		const stats = await pipeline.importNotes({ filePath: "test.md", text: "Some notes" });
+-		assert.equal(stats.nodes, 1);
+-		assert.equal(auditorCalled, false, "Auditor LLM must not be called when graph has 0 nodes");
+-	});
+-
+-	it("skips auditor LLM call when no candidates match any propositions", async () => {
+-		let auditorCalled = false;
+-		const existingNode: GraphNode = {
+-			id: "existing_1",
+-			name: "Completely Unrelated Zoology",
+-			statement: "Mammals have hair and produce milk.",
+-			aliases: [],
+-			provenance: [{ chatId: "src_1", messageId: "" }],
+-			createdAt: "2026-11-13T00:00:00.000Z",
+-		};
+-		const graphStore = createMemoryGraphStore([existingNode]);
+-
+-		const pipeline = createExtractionPipeline({
+-			chatStore,
+-			graphStore,
+-			extractor: submitEngine("submit_findings", {
+-				propositions: [{ id: "p2", name: "Quantum Superposition", statement: "Particles exist in multiple states." }],
+-				chains: [],
+-			}),
+-			auditor: submitEngine("submit_review", { links: [] }, () => {
+-				auditorCalled = true;
+-			}),
+-		});
+-
+-		const stats = await pipeline.importNotes({ filePath: "quantum.md", text: "Quantum physics text" });
+-		assert.equal(stats.nodes, 1);
+-		assert.equal(auditorCalled, false, "Auditor LLM must not be called when 0 candidates match");
+-	});
+-});
+diff --git a/tests/settings.test.ts b/tests/settings.test.ts
+index 93a85d1..bcef638 100644
+--- a/tests/settings.test.ts
++++ b/tests/settings.test.ts
+@@ -26,7 +26,7 @@ describe("FACTORY_SETTINGS (the compiled factory layer)", () => {
+ 		// redesign's chunk budget (2026-09-24); doubled to 8192 with the
+ 		// digest-aware redesign (2026-09-30), then HALVED BACK to 4096
+ 		// with the message anchors (owner, 2026-10-13)
+-		assert.deepEqual(FACTORY_SETTINGS.graph, { enabled: true, rendering: true, extractionChunkTokens: 4096, ocrBaiduEnabled: false });
++		assert.deepEqual(FACTORY_SETTINGS.graph, { enabled: true, rendering: true, extractionChunkTokens: 4096 });
+ 		const a = FACTORY_SETTINGS.appearance;
+ 		assert.equal(a.theme, "default");
+ 		assert.equal(a.background, null); // the theme's own background, not a factory hex
+-- 
+2.53.0.windows.1
+
