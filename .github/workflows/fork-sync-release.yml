@@ -47,7 +47,7 @@ jobs:
       - name: Fetch upstream and tags
         run: |
           git remote add upstream https://github.com/amosblomqvist/learnharness.git || git remote set-url upstream https://github.com/amosblomqvist/learnharness.git
-          git fetch upstream main --tags
+          git fetch upstream main --tags --force
       - name: Sync with upstream if new commits exist
         run: |
           if ! git merge-base --is-ancestor upstream/main HEAD; then
