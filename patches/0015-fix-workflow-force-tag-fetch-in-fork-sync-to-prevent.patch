@@ -1,0 +1,26 @@
+From 1cf9fb9fa6a7394134cdeaa20405d5353777c0eb Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Fri, 13 Nov 2026 14:01:22 +0800
+Subject: [PATCH 15/16] fix(workflow): force tag fetch in fork sync to prevent
+ clobber rejection
+
+---
+ .github/workflows/fork-sync-release.yml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/.github/workflows/fork-sync-release.yml b/.github/workflows/fork-sync-release.yml
+index 7d70510..b34cf5d 100644
+--- a/.github/workflows/fork-sync-release.yml
++++ b/.github/workflows/fork-sync-release.yml
+@@ -47,7 +47,7 @@ jobs:
+       - name: Fetch upstream and tags
+         run: |
+           git remote add upstream https://github.com/amosblomqvist/learnharness.git || git remote set-url upstream https://github.com/amosblomqvist/learnharness.git
+-          git fetch upstream main --tags
++          git fetch upstream main --tags --force
+       - name: Sync with upstream if new commits exist
+         run: |
+           if ! git merge-base --is-ancestor upstream/main HEAD; then
+-- 
+2.53.0.windows.1
+

@@ -1,7 +1,7 @@
 From a43ac7c58eb1acc4cd5163a2b429a5b7ca399745 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 29 Oct 2026 15:31:19 +0800
-Subject: [PATCH 01/14] feat(providers): add 9router provider support with
+Subject: [PATCH 01/16] feat(providers): add 9router provider support with
  model catalog and key management
 
 ---

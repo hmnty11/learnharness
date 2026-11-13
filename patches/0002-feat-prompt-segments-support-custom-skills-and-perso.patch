@@ -1,7 +1,7 @@
 From 15ef97a29a0ec798491d5e6e771f3d8c186a122f Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 29 Oct 2026 15:31:24 +0800
-Subject: [PATCH 02/14] feat(prompt-segments): support custom skills and
+Subject: [PATCH 02/16] feat(prompt-segments): support custom skills and
  personalization segment composition
 
 ---
