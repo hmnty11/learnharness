@@ -66,3 +66,5 @@ export { claudeCodeInstallationResponse } from "./claude-code.ts";
 export * from "./custom-provider.ts";
 export { customProviderGet, customProviderMutation } from "./custom-provider-http.ts";
 export * from "./sync.ts";
+export * from "./markitdown.ts";
+export * from "./baidu-ocr.ts";
