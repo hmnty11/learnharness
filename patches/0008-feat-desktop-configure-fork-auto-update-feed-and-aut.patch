@@ -1,7 +1,7 @@
 From 01e5efd11ebd6569541a92bbcedca80a8ebf2ad0 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 12 Nov 2026 08:39:42 +0800
-Subject: [PATCH 08/12] feat(desktop): configure fork auto-update feed and
+Subject: [PATCH 08/14] feat(desktop): configure fork auto-update feed and
  automated patched release workflow
 
 ---

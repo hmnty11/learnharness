@@ -1,0 +1,1499 @@
+From fadceb0378d99d58120bdaf105855411a3c385f0 Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Fri, 13 Nov 2026 11:15:32 +0800
+Subject: [PATCH 14/14] feat(import): add MarkItDown docx/pdf conversion and
+ Baidu unlimited OCR for PDF
+
+---
+ app/api/graph/import/route.ts     |  30 ++-
+ lib/notes-import-limits.ts        |   4 +-
+ src/agent/subagents/baidu-ocr.ts  | 330 ++++++++++++++++++++++++++++
+ src/agent/subagents/markitdown.ts | 352 ++++++++++++++++++++++++++++++
+ src/agent/tools/read.ts           |   8 +-
+ src/server/baidu-ocr.ts           |   7 +
+ src/server/index.ts               |   2 +
+ src/server/markitdown.ts          |   6 +
+ src/server/plugin-documents.ts    |  69 ++++--
+ tests/baidu-ocr.test.ts           | 255 ++++++++++++++++++++++
+ tests/markitdown.test.ts          | 213 ++++++++++++++++++
+ tests/notes-import-queue.test.ts  |   4 +-
+ tests/notes-import-route.test.ts  |   4 +-
+ tests/notes-import.test.tsx       |   5 +-
+ 14 files changed, 1260 insertions(+), 29 deletions(-)
+ create mode 100644 src/agent/subagents/baidu-ocr.ts
+ create mode 100644 src/agent/subagents/markitdown.ts
+ create mode 100644 src/server/baidu-ocr.ts
+ create mode 100644 src/server/markitdown.ts
+ create mode 100644 tests/baidu-ocr.test.ts
+ create mode 100644 tests/markitdown.test.ts
+
+diff --git a/app/api/graph/import/route.ts b/app/api/graph/import/route.ts
+index a2ce206..04ceed4 100644
+--- a/app/api/graph/import/route.ts
++++ b/app/api/graph/import/route.ts
+@@ -20,7 +20,7 @@
+  * healthy. The dock's chips + graph refetch track progress live through
+  * /api/graph/status, as with session runs.
+  */
+-import { convertPdf, extraction, joinPages, NotesImportError, sourceDirectory } from "@/src/server";
++import { applyBaiduOcrToPdf, convertDocx, convertPdf, convertPdfWithMarkitdown, extraction, joinPages, NotesImportError, sourceDirectory } from "@/src/server";
+ import { IMPORT_EXTENSIONS, MAX_IMPORT_BODY_BYTES, MAX_IMPORT_BYTES, UNSUPPORTED_TYPE_MESSAGE, validNotesPath } from "@/lib/notes-import-limits.ts";
+ import { FormBodyLimitError, readBoundedFormData } from "@/lib/bounded-form-data.ts";
+ import {
+@@ -61,10 +61,22 @@ type NotesFile = { kind: "notes"; text: string; notice?: string } | { kind: "ref
+ async function readNotesFile(file: File): Promise<NotesFile> {
+ 	if (!IMPORT_EXTENSIONS.test(file.name)) return { kind: "refused", error: UNSUPPORTED_TYPE_MESSAGE };
+ 	const bytes = new Uint8Array(await file.arrayBuffer());
++	if (/\.docx$/i.test(file.name)) {
++		try {
++			const docx = await convertDocx(bytes, file.name);
++			return { kind: "notes", text: docx.markdown, notice: docx.notices.join(" ") };
++		} catch {
++			return { kind: "refused", error: "Could not open this DOCX document." };
++		}
++	}
+ 	if (!PDF_MAGIC.every((byte, i) => bytes[i] === byte)) {
+ 		if (bytes.subarray(0, 8192).includes(0)) return { kind: "refused", error: "This file isn't plain text." };
+ 		return { kind: "notes", text: new TextDecoder().decode(bytes) };
+ 	}
++	const markitdown = await convertPdfWithMarkitdown(bytes, file.name);
++	if (markitdown) {
++		return { kind: "notes", text: markitdown.markdown, notice: markitdown.notices.join(" ") };
++	}
+ 	const pdf = await convertPdf(bytes, MAX_PDF_PAGES);
+ 	switch (pdf.kind) {
+ 		case "unreadable":
+@@ -72,11 +84,21 @@ async function readNotesFile(file: File): Promise<NotesFile> {
+ 		case "too-long":
+ 			return { kind: "refused", error: "Too long. Max 1,000 pages." };
+ 		case "converted": {
+-			const text = joinPages(pdf.pages);
++			let pages = pdf.pages;
++			let ocrNotice = "";
++			const needsOcr = pages.some((page) => page.kind === "image-only") || !pages.some((page) => page.kind === "text" && page.markdown.trim());
++			if (needsOcr) {
++				const ocrResult = await applyBaiduOcrToPdf(bytes, pages);
++				pages = ocrResult.pages;
++				if (ocrResult.ocrCount > 0) {
++					ocrNotice = " Processed with Baidu OCR.";
++				}
++			}
++			const text = joinPages(pages);
+ 			if (!text) return { kind: "refused", error: "OCR not supported yet." };
+-			const skipped = pdf.pages.filter((page) => page.kind === "image-only").length;
++			const skipped = pages.filter((page) => page.kind === "image-only").length;
+ 			const omission = skipped > 0 ? ` Skipped ${skipped} image-only ${skipped === 1 ? "page" : "pages"}; OCR is not supported.` : "";
+-			return { kind: "notes", text, notice: `Scanned pages may have errors.${omission}` };
++			return { kind: "notes", text, notice: `Scanned pages may have errors.${omission}${ocrNotice}` };
+ 		}
+ 	}
+ }
+diff --git a/lib/notes-import-limits.ts b/lib/notes-import-limits.ts
+index 27aa951..dfd1a44 100644
+--- a/lib/notes-import-limits.ts
++++ b/lib/notes-import-limits.ts
+@@ -3,10 +3,10 @@ export const MAX_IMPORT_BYTES = 25 * 1024 * 1024;
+ export const MAX_IMPORT_BODY_BYTES = 26 * 1024 * 1024;
+ 
+ /** The file types "Extract files" takes; the client check, server check and picker `accept` all derive from this list. */
+-const IMPORT_EXTENSION_NAMES = ["txt", "md", "markdown", "rst", "org", "adoc", "tex", "pdf"];
++const IMPORT_EXTENSION_NAMES = ["txt", "md", "markdown", "rst", "org", "adoc", "tex", "pdf", "docx"];
+ export const IMPORT_EXTENSIONS = new RegExp(`\\.(?:${IMPORT_EXTENSION_NAMES.join("|")})$`, "i");
+ export const IMPORT_ACCEPT = IMPORT_EXTENSION_NAMES.map((name) => `.${name}`).join(",");
+-export const UNSUPPORTED_TYPE_MESSAGE = "This file type isn't supported. Use text, Markdown, or PDF.";
++export const UNSUPPORTED_TYPE_MESSAGE = "This file type isn't supported. Use text, Markdown, PDF, or DOCX.";
+ 
+ /** Contributor's relative-path contract: identity only, never a disk path.
+  * Chromium may serialize the basename or the full webkitRelativePath. */
+diff --git a/src/agent/subagents/baidu-ocr.ts b/src/agent/subagents/baidu-ocr.ts
+new file mode 100644
+index 0000000..568a1d6
+--- /dev/null
++++ b/src/agent/subagents/baidu-ocr.ts
+@@ -0,0 +1,330 @@
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++import type { PdfPage } from "./pdf-markdown.ts";
++import { pdfCanvasGeometry } from "./headless.ts";
++import { standardFontsDir } from "./pdf-ops.ts";
++
++const defaultExecFileAsync = promisify(execFile);
++
++export interface BaiduOcrOptions {
++	signal?: AbortSignal;
++	fetch?: typeof globalThis.fetch;
++	execFile?: (
++		file: string,
++		args: string[],
++		options: { timeout?: number; signal?: AbortSignal; maxBuffer?: number; windowsHide?: boolean },
++	) => Promise<{ stdout: string; stderr: string }>;
++}
++
++let cachedCloudToken: { token: string; expiresAt: number } | null = null;
++
++/**
++ * Acquire Baidu AI Cloud OAuth access token using client_id and client_secret.
++ */
++async function getBaiduCloudAccessToken(fetchFn: typeof globalThis.fetch, signal?: AbortSignal): Promise<string | null> {
++	if (process.env.BAIDU_OCR_ACCESS_TOKEN) {
++		return process.env.BAIDU_OCR_ACCESS_TOKEN;
++	}
++	const apiKey = process.env.BAIDU_OCR_API_KEY;
++	const secretKey = process.env.BAIDU_OCR_SECRET_KEY;
++	if (!apiKey || !secretKey) return null;
++
++	if (cachedCloudToken && Date.now() < cachedCloudToken.expiresAt - 60_000) {
++		return cachedCloudToken.token;
++	}
++
++	try {
++		const url = `https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=${encodeURIComponent(apiKey)}&client_secret=${encodeURIComponent(secretKey)}`;
++		const res = await fetchFn(url, { method: "POST", signal });
++		if (!res.ok) return null;
++		const data = (await res.json()) as { access_token?: string; expires_in?: number };
++		if (data.access_token) {
++			const expiresAt = Date.now() + (data.expires_in ?? 2592000) * 1000;
++			cachedCloudToken = { token: data.access_token, expiresAt };
++			return data.access_token;
++		}
++	} catch (err) {
++		if (signal?.aborted) throw err;
++	}
++	return null;
++}
++
++/**
++ * Call Baidu AI Cloud general basic OCR API.
++ */
++async function tryBaiduCloudOcr(
++	imageBuffer: Uint8Array,
++	options?: BaiduOcrOptions,
++): Promise<string | null> {
++	const fetchFn = options?.fetch ?? globalThis.fetch;
++	const token = await getBaiduCloudAccessToken(fetchFn, options?.signal);
++	if (!token) return null;
++
++	try {
++		const base64Image = Buffer.from(imageBuffer).toString("base64");
++		const url = `https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic?access_token=${encodeURIComponent(token)}`;
++		const res = await fetchFn(url, {
++			method: "POST",
++			headers: { "Content-Type": "application/x-www-form-urlencoded" },
++			body: `image=${encodeURIComponent(base64Image)}`,
++			signal: options?.signal,
++		});
++		if (!res.ok) return null;
++		const data = (await res.json()) as {
++			words_result?: Array<{ words: string }>;
++			words_result_num?: number;
++			error_code?: number;
++			error_msg?: string;
++		};
++		if (data.words_result && Array.isArray(data.words_result) && data.words_result.length > 0) {
++			const lines = data.words_result.map((w) => w.words).filter(Boolean);
++			if (lines.length > 0) {
++				return lines.join("\n");
++			}
++		}
++	} catch (err) {
++		if (options?.signal?.aborted) throw err;
++	}
++	return null;
++}
++
++/**
++ * Parse stdout emitted by Baidu PaddleOCR CLI.
++ */
++export function parsePaddleOcrStdout(stdout: string): string | null {
++	const lines: string[] = [];
++	for (const rawLine of stdout.split(/\r?\n/)) {
++		const trimmed = rawLine.trim();
++		if (!trimmed) continue;
++		if (/^\[(INFO|DEBUG|WARNING|ERROR)\]/i.test(trimmed)) continue;
++		if (/^\[\d{4}[-/]\d{2}[-/]\d{2}/.test(trimmed)) continue;
++
++		// Match PaddleOCR line pattern: [box, ('recognized text', confidence)] or ('recognized text', confidence)
++		const match = trimmed.match(/\(\s*['"](.*?)['"]\s*,\s*([0-9.]+)\s*\)\s*\]?$/);
++		if (match && match[1]) {
++			lines.push(match[1]);
++		}
++	}
++	if (lines.length > 0) return lines.join("\n");
++
++	// Fallback if stdout is plain text lines
++	const fallbackLines: string[] = [];
++	for (const rawLine of stdout.split(/\r?\n/)) {
++		const trimmed = rawLine.trim();
++		if (!trimmed) continue;
++		if (/^\[(INFO|DEBUG|WARNING|ERROR)\]/i.test(trimmed)) continue;
++		if (/^\[\d{4}[-/]\d{2}[-/]\d{2}/.test(trimmed)) continue;
++		if (trimmed.startsWith("Traceback ") || trimmed.includes("ModuleNotFoundError")) continue;
++		fallbackLines.push(trimmed);
++	}
++	return fallbackLines.length > 0 ? fallbackLines.join("\n") : null;
++}
++
++/**
++ * Execute offline Baidu PaddleOCR via child_process.
++ */
++async function tryPaddleOcr(
++	imageBuffer: Uint8Array,
++	options?: BaiduOcrOptions,
++): Promise<string | null> {
++	options?.signal?.throwIfAborted();
++	const execFn = options?.execFile ?? defaultExecFileAsync;
++	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "paddleocr-"));
++	const tempFilePath = path.join(tempDir, "page.png");
++
++	try {
++		await fs.writeFile(tempFilePath, imageBuffer);
++		options?.signal?.throwIfAborted();
++
++		let stdout: string | null = null;
++
++		// 1. Try `paddleocr` CLI
++		try {
++			const cli = process.platform === "win32" ? "paddleocr.exe" : "paddleocr";
++			const res = await execFn(cli, ["--image_dir", tempFilePath, "--use_angle_cls", "true"], {
++				timeout: 30_000,
++				signal: options?.signal,
++				maxBuffer: 20 * 1024 * 1024,
++				windowsHide: true,
++			});
++			stdout = res.stdout;
++		} catch (err: unknown) {
++			if (options?.signal?.aborted) throw err;
++		}
++
++		// 2. Fallback to `python -m paddleocr`
++		if (stdout === null) {
++			try {
++				const res = await execFn("python", ["-m", "paddleocr", "--image_dir", tempFilePath, "--use_angle_cls", "true"], {
++					timeout: 30_000,
++					signal: options?.signal,
++					maxBuffer: 20 * 1024 * 1024,
++					windowsHide: true,
++				});
++				stdout = res.stdout;
++			} catch (err: unknown) {
++				if (options?.signal?.aborted) throw err;
++			}
++		}
++
++		// 3. Fallback to `python3 -m paddleocr`
++		if (stdout === null) {
++			try {
++				const res = await execFn("python3", ["-m", "paddleocr", "--image_dir", tempFilePath, "--use_angle_cls", "true"], {
++					timeout: 30_000,
++					signal: options?.signal,
++					maxBuffer: 20 * 1024 * 1024,
++					windowsHide: true,
++				});
++				stdout = res.stdout;
++			} catch (err: unknown) {
++				if (options?.signal?.aborted) throw err;
++			}
++		}
++
++		if (!stdout) return null;
++		return parsePaddleOcrStdout(stdout);
++	} finally {
++		await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
++	}
++}
++
++/**
++ * Try OCR on an image buffer using Baidu AI Cloud OCR (if configured) or Baidu PaddleOCR offline.
++ * Returns text markdown or null if unavailable / failed.
++ */
++export async function tryBaiduOcr(
++	imageBuffer: Uint8Array,
++	options?: BaiduOcrOptions,
++): Promise<string | null> {
++	options?.signal?.throwIfAborted();
++
++	// 1. Try Baidu AI Cloud OCR if credentials are present
++	if (process.env.BAIDU_OCR_ACCESS_TOKEN || (process.env.BAIDU_OCR_API_KEY && process.env.BAIDU_OCR_SECRET_KEY)) {
++		const cloudResult = await tryBaiduCloudOcr(imageBuffer, options);
++		if (cloudResult && cloudResult.trim().length > 0) {
++			return cloudResult.trim();
++		}
++	}
++
++	// 2. Try Baidu PaddleOCR (unlimited offline open-source OCR)
++	const paddleResult = await tryPaddleOcr(imageBuffer, options);
++	if (paddleResult && paddleResult.trim().length > 0) {
++		return paddleResult.trim();
++	}
++
++	return null;
++}
++
++export interface ApplyBaiduOcrOptions extends BaiduOcrOptions {
++	ocrFn?: (imageBuffer: Uint8Array, options?: { signal?: AbortSignal }) => Promise<string | null>;
++	renderPage?: (pdfData: Uint8Array, pageNumber: number, options?: { signal?: AbortSignal }) => Promise<Uint8Array | null>;
++}
++
++/**
++ * Apply Baidu OCR to image-only / unscanned pages of a PDF document.
++ * Returns the updated pages and the number of pages successfully OCR-processed.
++ */
++export async function applyBaiduOcrToPdf(
++	pdfData: Uint8Array,
++	pages: PdfPage[],
++	options?: ApplyBaiduOcrOptions,
++): Promise<{ pages: PdfPage[]; ocrCount: number }> {
++	options?.signal?.throwIfAborted();
++	const ocr = options?.ocrFn ?? ((img, opts) => tryBaiduOcr(img, { ...options, ...opts }));
++
++	const hasText = pages.some((p) => p.kind === "text" && p.markdown.trim().length > 0);
++	const targetIndices = new Set<number>();
++	for (let i = 0; i < pages.length; i++) {
++		const p = pages[i]!;
++		if (p.kind === "image-only" || (!hasText && p.kind === "empty")) {
++			targetIndices.add(i);
++		}
++	}
++
++	if (targetIndices.size === 0) {
++		return { pages, ocrCount: 0 };
++	}
++
++	let ocrCount = 0;
++	const updatedPages: PdfPage[] = [...pages];
++
++	if (options?.renderPage) {
++		for (const idx of targetIndices) {
++			options?.signal?.throwIfAborted();
++			const page = pages[idx]!;
++			try {
++				const imgBuffer = await options.renderPage(pdfData, page.number, { signal: options?.signal });
++				if (imgBuffer) {
++					const text = await ocr(imgBuffer, { signal: options?.signal });
++					if (text && text.trim().length > 0) {
++						updatedPages[idx] = { kind: "text", number: page.number, markdown: text.trim() };
++						ocrCount++;
++					}
++				}
++			} catch (err) {
++				if (options?.signal?.aborted) throw err;
++			}
++		}
++		return { pages: updatedPages, ocrCount };
++	}
++
++	// Native rendering via pdfjs + @napi-rs/canvas
++	let loadingTask: {
++		promise: Promise<any>;
++		destroy(): Promise<void>;
++	} | undefined;
++
++	try {
++		// Static import cannot work: pdfjs-dist legacy and @napi-rs/canvas contain native addons excluded from browser bundling.
++		const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
++		const { createCanvas } = await import("@napi-rs/canvas");
++		loadingTask = pdfjs.getDocument({
++			data: pdfData,
++			standardFontDataUrl: standardFontsDir(),
++			verbosity: 0,
++		});
++		const doc = await loadingTask.promise;
++		options?.signal?.throwIfAborted();
++
++		for (const idx of targetIndices) {
++			options?.signal?.throwIfAborted();
++			const page = pages[idx]!;
++			if (page.number >= 1 && page.number <= doc.numPages) {
++				try {
++					const pg = await doc.getPage(page.number);
++					const base = pg.getViewport({ scale: 1 });
++					const geometry = pdfCanvasGeometry(base.width, base.height, 150);
++					const vp = pg.getViewport({ scale: geometry.scale });
++					const canvas = createCanvas(geometry.width, geometry.height);
++					const ctx = canvas.getContext("2d");
++					await pg.render({
++						canvasContext: ctx as unknown as CanvasRenderingContext2D,
++						canvas: canvas as unknown as HTMLCanvasElement,
++						viewport: vp,
++					}).promise;
++					const imgBuffer = new Uint8Array(canvas.toBuffer("image/png"));
++					const text = await ocr(imgBuffer, { signal: options?.signal });
++					if (text && text.trim().length > 0) {
++						updatedPages[idx] = { kind: "text", number: page.number, markdown: text.trim() };
++						ocrCount++;
++					}
++				} catch (err) {
++					if (options?.signal?.aborted) throw err;
++				}
++			}
++		}
++	} catch (err) {
++		if (options?.signal?.aborted) throw err;
++		return { pages, ocrCount: 0 };
++	} finally {
++		try {
++			await loadingTask?.destroy();
++		} catch {}
++	}
++
++	return { pages: updatedPages, ocrCount };
++}
+diff --git a/src/agent/subagents/markitdown.ts b/src/agent/subagents/markitdown.ts
+new file mode 100644
+index 0000000..d1b46ee
+--- /dev/null
++++ b/src/agent/subagents/markitdown.ts
+@@ -0,0 +1,352 @@
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import * as zlib from "node:zlib";
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++
++const execFileAsync = promisify(execFile);
++
++/**
++ * Execute Microsoft MarkItDown CLI via child_process with a 30s timeout and signal support.
++ * Returns the stdout markdown string if successful, or null if not installed / fails.
++ */
++export async function tryConvertWithMarkitdown(
++	buffer: Uint8Array,
++	filename: string,
++	options?: { signal?: AbortSignal },
++): Promise<{ markdown: string; notices: string[] } | null> {
++	options?.signal?.throwIfAborted();
++	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "markitdown-"));
++	const ext = path.extname(filename) || (filename.toLowerCase().endsWith(".pdf") ? ".pdf" : ".docx");
++	const tempFilePath = path.join(tempDir, `input${ext}`);
++
++	try {
++		await fs.writeFile(tempFilePath, buffer);
++		options?.signal?.throwIfAborted();
++
++		let stdout: string | null = null;
++		// 1. Try `markitdown` CLI
++		try {
++			const cli = process.platform === "win32" ? "markitdown.cmd" : "markitdown";
++			const res = await execFileAsync(cli, [tempFilePath], {
++				timeout: 30_000,
++				signal: options?.signal,
++				maxBuffer: 20 * 1024 * 1024,
++				windowsHide: true,
++			});
++			stdout = res.stdout;
++		} catch (err: unknown) {
++			if (options?.signal?.aborted) throw err;
++		}
++
++		// 2. Fallback to `python -m markitdown`
++		if (stdout === null) {
++			try {
++				const res = await execFileAsync("python", ["-m", "markitdown", tempFilePath], {
++					timeout: 30_000,
++					signal: options?.signal,
++					maxBuffer: 20 * 1024 * 1024,
++					windowsHide: true,
++				});
++				stdout = res.stdout;
++			} catch (err: unknown) {
++				if (options?.signal?.aborted) throw err;
++			}
++		}
++
++		// 3. Fallback to `python3 -m markitdown`
++		if (stdout === null) {
++			try {
++				const res = await execFileAsync("python3", ["-m", "markitdown", tempFilePath], {
++					timeout: 30_000,
++					signal: options?.signal,
++					maxBuffer: 20 * 1024 * 1024,
++					windowsHide: true,
++				});
++				stdout = res.stdout;
++			} catch (err: unknown) {
++				if (options?.signal?.aborted) throw err;
++			}
++		}
++
++		if (stdout === null) return null;
++		const markdown = stdout.trim();
++		if (!markdown) return null;
++		return { markdown, notices: ["Converted with Microsoft MarkItDown."] };
++	} catch (err: unknown) {
++		if (options?.signal?.aborted) throw err;
++		return null;
++	} finally {
++		await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
++	}
++}
++
++/** Decode XML entities and character references. */
++function decodeXml(str: string): string {
++	return str
++		.replace(/&amp;/g, "&")
++		.replace(/&lt;/g, "<")
++		.replace(/&gt;/g, ">")
++		.replace(/&quot;/g, "\"")
++		.replace(/&apos;/g, "'")
++		.replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(Number(dec)))
++		.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
++}
++
++/** Read entries from a ZIP archive. */
++function readZipEntries(buffer: Uint8Array): Map<string, Buffer> {
++	const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
++	if (buf.length < 22) throw new Error("Invalid archive: file too small");
++	if (buf.readUInt32LE(0) !== 0x04034b50) {
++		throw new Error("Invalid archive: missing PK signature");
++	}
++
++	const entries = new Map<string, Buffer>();
++
++	// Find EOCD
++	let eocdOffset = -1;
++	const minSearch = Math.max(0, buf.length - 65557);
++	for (let i = buf.length - 22; i >= minSearch; i--) {
++		if (buf.readUInt32LE(i) === 0x06054b50) {
++			eocdOffset = i;
++			break;
++		}
++	}
++
++	if (eocdOffset !== -1) {
++		const totalEntries = buf.readUInt16LE(eocdOffset + 10);
++		const cdOffset = buf.readUInt32LE(eocdOffset + 16);
++
++		let pos = cdOffset;
++		for (let i = 0; i < totalEntries; i++) {
++			if (pos + 46 > buf.length || buf.readUInt32LE(pos) !== 0x02014b50) break;
++			const method = buf.readUInt16LE(pos + 10);
++			const compressedSize = buf.readUInt32LE(pos + 20);
++			const nameLen = buf.readUInt16LE(pos + 28);
++			const extraLen = buf.readUInt16LE(pos + 30);
++			const commentLen = buf.readUInt16LE(pos + 32);
++			const localOffset = buf.readUInt32LE(pos + 42);
++
++			const name = buf.subarray(pos + 46, pos + 46 + nameLen).toString("utf8");
++
++			if (localOffset + 30 <= buf.length && buf.readUInt32LE(localOffset) === 0x04034b50) {
++				const localNameLen = buf.readUInt16LE(localOffset + 26);
++				const localExtraLen = buf.readUInt16LE(localOffset + 28);
++				const dataStart = localOffset + 30 + localNameLen + localExtraLen;
++				if (dataStart + compressedSize <= buf.length) {
++					const slice = buf.subarray(dataStart, dataStart + compressedSize);
++					let decompressed: Buffer | null = null;
++					if (method === 0) decompressed = slice;
++					else if (method === 8) {
++						try { decompressed = zlib.inflateRawSync(slice); } catch {}
++					}
++					if (decompressed) entries.set(name, decompressed);
++				}
++			}
++			pos += 46 + nameLen + extraLen + commentLen;
++		}
++	}
++
++	// Fallback to sequential local header scanning if central directory gave 0 entries
++	if (entries.size === 0) {
++		let offset = 0;
++		while (offset + 30 <= buf.length && buf.readUInt32LE(offset) === 0x04034b50) {
++			const method = buf.readUInt16LE(offset + 8);
++			const compSize = buf.readUInt32LE(offset + 18);
++			const nameLen = buf.readUInt16LE(offset + 26);
++			const extraLen = buf.readUInt16LE(offset + 28);
++			const name = buf.subarray(offset + 30, offset + 30 + nameLen).toString("utf8");
++			const dataStart = offset + 30 + nameLen + extraLen;
++			if (compSize > 0 && dataStart + compSize <= buf.length) {
++				const slice = buf.subarray(dataStart, dataStart + compSize);
++				if (method === 0) entries.set(name, slice);
++				else if (method === 8) {
++					try { entries.set(name, zlib.inflateRawSync(slice)); } catch {}
++				}
++				offset = dataStart + compSize;
++			} else {
++				break;
++			}
++		}
++	}
++
++	return entries;
++}
++
++/** Parse paragraph XML into Markdown text line. */
++function parseParagraph(pXml: string, rels: Map<string, string>): string {
++	const styleMatch = pXml.match(/<w:pStyle[^>]*w:val="([^"]+)"/);
++	const numPrMatch = pXml.match(/<w:numPr>[\s\S]*?<\/w:numPr>/);
++
++	let prefix = "";
++	if (styleMatch && styleMatch[1]) {
++		const val = styleMatch[1].toLowerCase().replace(/\s+/g, "");
++		if (val === "heading1" || val === "title") prefix = "# ";
++		else if (val === "heading2" || val === "subtitle") prefix = "## ";
++		else if (val === "heading3") prefix = "### ";
++		else if (val === "heading4") prefix = "#### ";
++		else if (val === "heading5") prefix = "##### ";
++		else if (val === "heading6") prefix = "###### ";
++	} else if (numPrMatch && numPrMatch[0]) {
++		const ilvlMatch = numPrMatch[0].match(/<w:ilvl[^>]*w:val="(\d+)"/);
++		const ilvl = ilvlMatch && ilvlMatch[1] ? parseInt(ilvlMatch[1], 10) : 0;
++		prefix = "  ".repeat(ilvl) + "- ";
++	}
++
++	let content = "";
++	const tokenRegex = /<w:t(?:\s+[^>]*)?>([\s\S]*?)<\/w:t>|<w:tab\/>|<w:br\/>|<w:drawing(?:\s+[^>]*)?>([\s\S]*?)<\/w:drawing>|<v:imagedata(?:\s+[^>]*)?>/g;
++	let match: RegExpExecArray | null;
++	while ((match = tokenRegex.exec(pXml)) !== null) {
++		if (match[1] !== undefined) {
++			content += decodeXml(match[1]);
++		} else if (match[0] === "<w:tab/>") {
++			content += "\t";
++		} else if (match[0] === "<w:br/>") {
++			content += "\n";
++		} else if (match[2] !== undefined) {
++			const blipMatch = match[2].match(/(?:r:embed|r:id|r:link)="([^"]+)"/);
++			if (blipMatch && blipMatch[1]) {
++				const id = blipMatch[1];
++				const target = rels.get(id) || id;
++				const sep = content.length > 0 && !content.endsWith(" ") ? " " : "";
++				content += `${sep}![Image](${target})`;
++			}
++		} else if (match[0] && match[0].startsWith("<v:imagedata")) {
++			const vmlMatch = match[0].match(/(?:r:id|r:embed)="([^"]+)"/);
++			if (vmlMatch && vmlMatch[1]) {
++				const id = vmlMatch[1];
++				const target = rels.get(id) || id;
++				const sep = content.length > 0 && !content.endsWith(" ") ? " " : "";
++				content += `${sep}![Image](${target})`;
++			}
++		}
++	}
++	const trimmed = content.trim();
++	if (!trimmed) return "";
++	return prefix + trimmed;
++}
++
++/** Parse table XML into Markdown table. */
++function parseTable(tblXml: string, rels: Map<string, string>): string {
++	const trRegex = /<w:tr(?:\s+[^>]*)?>([\s\S]*?)<\/w:tr>/g;
++	const rows: string[][] = [];
++	let trMatch: RegExpExecArray | null;
++	while ((trMatch = trRegex.exec(tblXml)) !== null) {
++		const row: string[] = [];
++		const rowXml = trMatch[1] ?? "";
++		const tcRegex = /<w:tc(?:\s+[^>]*)?>([\s\S]*?)<\/w:tc>/g;
++		let tcMatch: RegExpExecArray | null;
++		while ((tcMatch = tcRegex.exec(rowXml)) !== null) {
++			const pRegex = /<w:p(?:\s+[^>]*)?>([\s\S]*?)<\/w:p>/g;
++			const cellTexts: string[] = [];
++			let pMatch: RegExpExecArray | null;
++			const cellXml = tcMatch[1] ?? "";
++			while ((pMatch = pRegex.exec(cellXml)) !== null) {
++				const pInner = pMatch[1] ?? "";
++				const text = parseParagraph(pInner, rels).trim();
++				if (text) cellTexts.push(text);
++			}
++			row.push(cellTexts.join(" ").replace(/\|/g, "\\|"));
++		}
++		if (row.length > 0) rows.push(row);
++	}
++	if (rows.length === 0) return "";
++	const maxCols = Math.max(...rows.map((r) => r.length), 1);
++	const normalizedRows = rows.map((r) => {
++		const copy = [...r];
++		while (copy.length < maxCols) copy.push("");
++		return copy;
++	});
++
++	const header = normalizedRows[0] ?? [];
++	const separator = new Array(maxCols).fill("---");
++	const markdownRows = [
++		`| ${header.join(" | ")} |`,
++		`| ${separator.join(" | ")} |`,
++		...normalizedRows.slice(1).map((r) => `| ${r.join(" | ")} |`),
++	];
++	return markdownRows.join("\n");
++}
++
++/** Parse DOCX bytes using pure Node fallback reader. */
++export function parseDocx(buffer: Uint8Array): string {
++	const entries = readZipEntries(buffer);
++	const docData = entries.get("word/document.xml");
++	if (!docData) throw new Error("Invalid DOCX: missing word/document.xml");
++
++	const rels = new Map<string, string>();
++	const relsData = entries.get("word/_rels/document.xml.rels");
++	if (relsData) {
++		const relsXml = relsData.toString("utf8");
++		const relRegex = /<Relationship\s+([^>]+)\/?>/g;
++		let match: RegExpExecArray | null;
++		while ((match = relRegex.exec(relsXml)) !== null) {
++			const attrs = match[1];
++			if (!attrs) continue;
++			const idMatch = attrs.match(/Id="([^"]+)"/);
++			const targetMatch = attrs.match(/Target="([^"]+)"/);
++			if (idMatch && idMatch[1] && targetMatch && targetMatch[1]) {
++				let target = targetMatch[1];
++				if (!target.startsWith("word/") && !target.startsWith("/") && !target.includes("://")) {
++					target = `word/${target}`;
++				}
++				rels.set(idMatch[1], target);
++			}
++		}
++	}
++
++	const docXml = docData.toString("utf8");
++	const bodyMatch = docXml.match(/<w:body>([\s\S]*?)<\/w:body>/);
++	if (!bodyMatch || !bodyMatch[1]) return "";
++	const body = bodyMatch[1];
++
++	const blockRegex = /<w:(p|tbl)(?:\s+[^>]*)?>([\s\S]*?)<\/w:\1>/g;
++	const blocks: string[] = [];
++	let match: RegExpExecArray | null;
++	while ((match = blockRegex.exec(body)) !== null) {
++		const tag = match[1] ?? "";
++		const inner = match[2] ?? "";
++		if (tag === "p") {
++			const line = parseParagraph(inner, rels);
++			if (line) blocks.push(line);
++		} else if (tag === "tbl") {
++			const table = parseTable(inner, rels);
++			if (table) blocks.push(table);
++		}
++	}
++	return blocks.join("\n\n").trim();
++}
++
++/**
++ * Convert DOCX buffer to Markdown.
++ * First tries MarkItDown CLI. Falls back to pure Node DOCX reader.
++ */
++export async function convertDocx(
++	buffer: Uint8Array,
++	filename: string,
++	options?: { signal?: AbortSignal },
++): Promise<{ markdown: string; notices: string[] }> {
++	options?.signal?.throwIfAborted();
++	const markitdown = await tryConvertWithMarkitdown(buffer, filename, options);
++	if (markitdown) return markitdown;
++	options?.signal?.throwIfAborted();
++
++	const markdown = parseDocx(buffer);
++	return {
++		markdown,
++		notices: ["Converted with built-in DOCX reader. Install Microsoft markitdown for full AI image analysis."],
++	};
++}
++
++/**
++ * Convert PDF buffer with MarkItDown CLI.
++ * Returns null if MarkItDown CLI is unavailable.
++ */
++export async function convertPdfWithMarkitdown(
++	buffer: Uint8Array,
++	filename: string,
++	options?: { signal?: AbortSignal },
++): Promise<{ markdown: string; notices: string[] } | null> {
++	return tryConvertWithMarkitdown(buffer, filename, options);
++}
+diff --git a/src/agent/tools/read.ts b/src/agent/tools/read.ts
+index c49548b..c4db1a7 100644
+--- a/src/agent/tools/read.ts
++++ b/src/agent/tools/read.ts
+@@ -5,6 +5,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
+ import { serverExecute, type ImageFileResult } from "../tool-execute.ts";
+ import { resolveSourcePath } from "./fs-shared.ts";
+ import { detectSupportedImageMimeTypeFromFile, processImage } from "../image-processing/index.ts";
++import { convertDocx } from "../subagents/markitdown.ts";
+ 
+ /**
+  * The read tool — sources v0 (2026-09): a Node port of pi's read semantics
+@@ -95,10 +96,15 @@ export function createReadTool(model?: ReadModel): AgentTool<typeof readInput> {
+ 	return {
+ 		name: "read",
+ 		label: "read",
+-		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50.0KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete. File access settings and protected-location denials apply; use ls without a path to discover allowed folders when restricted.`,
++		description: `Read the contents of a file. Supports text files, DOCX documents, and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50.0KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete. File access settings and protected-location denials apply; use ls without a path to discover allowed folders when restricted.`,
+ 		parameters: readInput,
+ 		execute: serverExecute("read", readInput, async ({ path: rawPath, offset, limit }, { signal }): Promise<string | ImageFileResult> => {
+ 			const absolute = resolveSourcePath(rawPath);
++			if (/\.docx$/i.test(absolute)) {
++				const buffer = await fs.readFile(absolute, { signal });
++				const docx = await convertDocx(buffer, absolute, { signal });
++				return readTextSlice(docx.markdown, offset, limit);
++			}
+ 			const mime = await detectSupportedImageMimeTypeFromFile(absolute);
+ 			const buffer = await fs.readFile(absolute, { signal });
+ 			if (mime) {
+diff --git a/src/server/baidu-ocr.ts b/src/server/baidu-ocr.ts
+new file mode 100644
+index 0000000..ebc83e4
+--- /dev/null
++++ b/src/server/baidu-ocr.ts
+@@ -0,0 +1,7 @@
++export {
++	tryBaiduOcr,
++	applyBaiduOcrToPdf,
++	parsePaddleOcrStdout,
++	type BaiduOcrOptions,
++	type ApplyBaiduOcrOptions,
++} from "../agent/subagents/baidu-ocr.ts";
+diff --git a/src/server/index.ts b/src/server/index.ts
+index 3092f00..3e60a80 100644
+--- a/src/server/index.ts
++++ b/src/server/index.ts
+@@ -66,3 +66,5 @@ export { claudeCodeInstallationResponse } from "./claude-code.ts";
+ export * from "./custom-provider.ts";
+ export { customProviderGet, customProviderMutation } from "./custom-provider-http.ts";
+ export * from "./sync.ts";
++export * from "./markitdown.ts";
++export * from "./baidu-ocr.ts";
+diff --git a/src/server/markitdown.ts b/src/server/markitdown.ts
+new file mode 100644
+index 0000000..45c6ba2
+--- /dev/null
++++ b/src/server/markitdown.ts
+@@ -0,0 +1,6 @@
++export {
++	tryConvertWithMarkitdown,
++	convertDocx,
++	convertPdfWithMarkitdown,
++	parseDocx,
++} from "../agent/subagents/markitdown.ts";
+diff --git a/src/server/plugin-documents.ts b/src/server/plugin-documents.ts
+index 425430a..9bb3eb7 100644
+--- a/src/server/plugin-documents.ts
++++ b/src/server/plugin-documents.ts
+@@ -2,6 +2,8 @@ import { readBoundedFormData, FormBodyLimitError } from "../../lib/bounded-form-
+ import { convertPdf } from "../agent/subagents/pdf-ops.ts";
+ import { joinPages } from "../agent/subagents/pdf-markdown.ts";
+ import { PluginHostError } from "./plugin-host.ts";
++import { convertDocx, convertPdfWithMarkitdown } from "./markitdown.ts";
++import { applyBaiduOcrToPdf } from "./baidu-ocr.ts";
+ 
+ export const MAX_DOCUMENT_BODY_BYTES = 26 * 1024 * 1024;
+ export const MAX_DOCUMENT_FILE_BYTES = 25 * 1024 * 1024;
+@@ -13,8 +15,16 @@ const CONTROL = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/;
+ /** Pure upload conversion only: no learning, provider, or storage services.
+  * Compose ONE instance process-wide. The fail-fast slot covers body reading,
+  * conversion, and converter teardown, even after the caller has aborted. */
+-export function createPluginDocumentConverter(deps: { convertPdf?: typeof convertPdf } = {}) {
++export function createPluginDocumentConverter(deps: {
++	convertPdf?: typeof convertPdf;
++	convertDocx?: typeof convertDocx;
++	convertPdfWithMarkitdown?: typeof convertPdfWithMarkitdown;
++	applyBaiduOcrToPdf?: typeof applyBaiduOcrToPdf;
++} = {}) {
+ 	const pdfConverter = deps.convertPdf ?? convertPdf;
++	const docxConverter = deps.convertDocx ?? convertDocx;
++	const pdfWithMarkitdown = deps.convertPdfWithMarkitdown ?? convertPdfWithMarkitdown;
++	const ocrPdf = deps.applyBaiduOcrToPdf ?? applyBaiduOcrToPdf;
+ 	let busy = false;
+ 	return {
+ 		async convert(request: Request, signal: AbortSignal): Promise<{ name: string; markdown: string; notices: string[] }> {
+@@ -42,25 +52,52 @@ export function createPluginDocumentConverter(deps: { convertPdf?: typeof conver
+ 				signal.throwIfAborted();
+ 				let markdown: string;
+ 				const notices: string[] = [];
+-				if (PDF_MAGIC.every((byte, i) => bytes[i] === byte) || /\.pdf$/i.test(file.name)) {
+-					// Await the actual converter, never an abort race: its promise includes
+-					// loading-task destruction, which must settle before releasing busy.
+-					let pdf;
+-					try { pdf = await pdfConverter(bytes, MAX_DOCUMENT_PDF_PAGES, { signal }); }
+-					catch {
++				if (/\.docx$/i.test(file.name)) {
++					let docx;
++					try {
++						docx = await docxConverter(bytes, file.name, { signal });
++					} catch {
+ 						signal.throwIfAborted();
+-						throw new PluginHostError(400, "Could not open this PDF.");
++						throw new PluginHostError(400, "Could not open this DOCX document.");
+ 					}
+ 					signal.throwIfAborted();
+-					if (pdf.kind === "unreadable") throw new PluginHostError(400, "Could not open this PDF.");
+-					if (pdf.kind === "too-long") throw new PluginHostError(400, "Too long. Max 1,000 pages.");
+-					const skipped = pdf.pages.filter((page) => page.kind === "image-only").length;
+-					if (!pdf.pages.some((page) => page.kind === "text" && page.markdown.trim())) {
+-						throw new PluginHostError(400, skipped ? "OCR is not supported. This PDF has no extractable text." : "This PDF is blank or contains no extractable text.");
++					if (!docx.markdown.trim()) {
++						throw new PluginHostError(400, "This document contains no text.");
++					}
++					markdown = docx.markdown;
++					notices.push(...docx.notices);
++				} else if (PDF_MAGIC.every((byte, i) => bytes[i] === byte) || /\.pdf$/i.test(file.name)) {
++					const markitdown = await pdfWithMarkitdown(bytes, file.name, { signal });
++					if (markitdown) {
++						markdown = markitdown.markdown;
++						notices.push(...markitdown.notices);
++					} else {
++						let pdf;
++						try { pdf = await pdfConverter(bytes, MAX_DOCUMENT_PDF_PAGES, { signal }); }
++						catch {
++							signal.throwIfAborted();
++							throw new PluginHostError(400, "Could not open this PDF.");
++						}
++						signal.throwIfAborted();
++						if (pdf.kind === "unreadable") throw new PluginHostError(400, "Could not open this PDF.");
++						if (pdf.kind === "too-long") throw new PluginHostError(400, "Too long. Max 1,000 pages.");
++						let pages = pdf.pages;
++						const needsOcr = pages.some((page) => page.kind === "image-only") || !pages.some((page) => page.kind === "text" && page.markdown.trim());
++						let ocrCount = 0;
++						if (needsOcr) {
++							const ocrResult = await ocrPdf(bytes, pages, { signal });
++							pages = ocrResult.pages;
++							ocrCount = ocrResult.ocrCount;
++						}
++						const skipped = pages.filter((page) => page.kind === "image-only").length;
++						if (!pages.some((page) => page.kind === "text" && page.markdown.trim())) {
++							throw new PluginHostError(400, skipped ? "OCR is not supported. This PDF has no extractable text." : "This PDF is blank or contains no extractable text.");
++						}
++						markdown = joinPages(pages);
++						notices.push("PDF text extraction may contain errors; check the result against the original.");
++						if (ocrCount > 0) notices.push("Processed with Baidu OCR.");
++						if (skipped) notices.push(`Skipped ${skipped} image-only ${skipped === 1 ? "page" : "pages"}; OCR is not supported.`);
+ 					}
+-					markdown = joinPages(pdf.pages);
+-					notices.push("PDF text extraction may contain errors; check the result against the original.");
+-					if (skipped) notices.push(`Skipped ${skipped} image-only ${skipped === 1 ? "page" : "pages"}; OCR is not supported.`);
+ 				} else {
+ 					try { markdown = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+ 					catch { throw new PluginHostError(400, "This document is not valid UTF-8 text."); }
+diff --git a/tests/baidu-ocr.test.ts b/tests/baidu-ocr.test.ts
+new file mode 100644
+index 0000000..1a6d226
+--- /dev/null
++++ b/tests/baidu-ocr.test.ts
+@@ -0,0 +1,255 @@
++import assert from "node:assert/strict";
++import { describe, it } from "node:test";
++import {
++	tryBaiduOcr,
++	applyBaiduOcrToPdf,
++	parsePaddleOcrStdout,
++} from "../src/server/baidu-ocr.ts";
++import type { PdfPage } from "../src/agent/subagents/pdf-markdown.ts";
++import { createPluginDocumentConverter } from "../src/server/plugin-documents.ts";
++import { tinyPdf } from "./helpers/tiny-pdf.ts";
++
++describe("Baidu Unlimited OCR", () => {
++	it("parsePaddleOcrStdout parses standard PaddleOCR output tuple format", () => {
++		const sampleStdout = [
++			"[INFO] 2026-11-13 10:00:00 paddleocr: loading models",
++			"[2026/11/13 10:00:01] ppocr INFO: ppocr init done",
++			"[[[10.0, 20.0], [200.0, 20.0], [200.0, 45.0], [10.0, 45.0]], ('Chapter 1: Introduction', 0.985)]",
++			"[[[10.0, 50.0], [300.0, 50.0], [300.0, 75.0], [10.0, 75.0]], ('Machine Learning Foundations', 0.992)]",
++		].join("\n");
++
++		const parsed = parsePaddleOcrStdout(sampleStdout);
++		assert.equal(parsed, "Chapter 1: Introduction\nMachine Learning Foundations");
++	});
++
++	it("parsePaddleOcrStdout falls back to plain text ignoring log lines", () => {
++		const sampleStdout = [
++			"[INFO] logger initialized",
++			"Plain recognized line 1",
++			"Plain recognized line 2",
++		].join("\n");
++
++		const parsed = parsePaddleOcrStdout(sampleStdout);
++		assert.equal(parsed, "Plain recognized line 1\nPlain recognized line 2");
++	});
++
++	it("tryBaiduOcr returns null gracefully when neither credentials nor paddleocr are available", async () => {
++		const oldToken = process.env.BAIDU_OCR_ACCESS_TOKEN;
++		const oldKey = process.env.BAIDU_OCR_API_KEY;
++		const oldSec = process.env.BAIDU_OCR_SECRET_KEY;
++		delete process.env.BAIDU_OCR_ACCESS_TOKEN;
++		delete process.env.BAIDU_OCR_API_KEY;
++		delete process.env.BAIDU_OCR_SECRET_KEY;
++
++		try {
++			const dummyImg = new Uint8Array([0x89, 0x50, 0x4e, 0x47]); // PNG header
++			const result = await tryBaiduOcr(dummyImg, {
++				execFile: async () => {
++					throw new Error("paddleocr not installed");
++				},
++			});
++			assert.equal(result, null);
++		} finally {
++			if (oldToken) process.env.BAIDU_OCR_ACCESS_TOKEN = oldToken;
++			if (oldKey) process.env.BAIDU_OCR_API_KEY = oldKey;
++			if (oldSec) process.env.BAIDU_OCR_SECRET_KEY = oldSec;
++		}
++	});
++
++	it("tryBaiduOcr uses Baidu AI Cloud OCR when BAIDU_OCR_ACCESS_TOKEN is present", async () => {
++		const oldToken = process.env.BAIDU_OCR_ACCESS_TOKEN;
++		process.env.BAIDU_OCR_ACCESS_TOKEN = "test-token-123";
++
++		try {
++			let calledUrl = "";
++			let calledBody = "";
++			const mockFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
++				calledUrl = String(input);
++				calledBody = String(init?.body);
++				return new Response(
++					JSON.stringify({
++						words_result: [{ words: "Extracted line 1" }, { words: "Extracted line 2" }],
++						words_result_num: 2,
++					}),
++					{ status: 200, headers: { "Content-Type": "application/json" } },
++				);
++			};
++
++			const dummyImg = new Uint8Array([1, 2, 3, 4]);
++			const result = await tryBaiduOcr(dummyImg, { fetch: mockFetch as typeof fetch });
++
++			assert.ok(calledUrl.includes("access_token=test-token-123"));
++			assert.ok(calledBody.startsWith("image="));
++			assert.equal(result, "Extracted line 1\nExtracted line 2");
++		} finally {
++			if (oldToken) process.env.BAIDU_OCR_ACCESS_TOKEN = oldToken;
++			else delete process.env.BAIDU_OCR_ACCESS_TOKEN;
++		}
++	});
++
++	it("tryBaiduOcr acquires token with API_KEY + SECRET_KEY then calls OCR", async () => {
++		const oldToken = process.env.BAIDU_OCR_ACCESS_TOKEN;
++		const oldKey = process.env.BAIDU_OCR_API_KEY;
++		const oldSec = process.env.BAIDU_OCR_SECRET_KEY;
++		delete process.env.BAIDU_OCR_ACCESS_TOKEN;
++		process.env.BAIDU_OCR_API_KEY = "mock-key";
++		process.env.BAIDU_OCR_SECRET_KEY = "mock-secret";
++
++		try {
++			const calls: string[] = [];
++			const mockFetch = async (input: RequestInfo | URL) => {
++				const url = String(input);
++				calls.push(url);
++				if (url.includes("/oauth/2.0/token")) {
++					return new Response(JSON.stringify({ access_token: "acquired-token-abc", expires_in: 3600 }), {
++						status: 200,
++						headers: { "Content-Type": "application/json" },
++					});
++				}
++				if (url.includes("/ocr/v1/general_basic")) {
++					return new Response(
++						JSON.stringify({
++							words_result: [{ words: "Baidu Cloud OCR text" }],
++							words_result_num: 1,
++						}),
++						{ status: 200, headers: { "Content-Type": "application/json" } },
++					);
++				}
++				return new Response("Not found", { status: 404 });
++			};
++
++			const dummyImg = new Uint8Array([1, 2, 3]);
++			const result = await tryBaiduOcr(dummyImg, { fetch: mockFetch as typeof fetch });
++
++			assert.equal(calls.length, 2);
++			assert.ok(calls[0]!.includes("oauth/2.0/token"));
++			assert.ok(calls[1]!.includes("access_token=acquired-token-abc"));
++			assert.equal(result, "Baidu Cloud OCR text");
++		} finally {
++			if (oldToken) process.env.BAIDU_OCR_ACCESS_TOKEN = oldToken;
++			if (oldKey) process.env.BAIDU_OCR_API_KEY = oldKey;
++			else delete process.env.BAIDU_OCR_API_KEY;
++			if (oldSec) process.env.BAIDU_OCR_SECRET_KEY = oldSec;
++			else delete process.env.BAIDU_OCR_SECRET_KEY;
++		}
++	});
++
++	it("tryBaiduOcr uses offline PaddleOCR when cloud credentials are not provided", async () => {
++		const oldToken = process.env.BAIDU_OCR_ACCESS_TOKEN;
++		const oldKey = process.env.BAIDU_OCR_API_KEY;
++		const oldSec = process.env.BAIDU_OCR_SECRET_KEY;
++		delete process.env.BAIDU_OCR_ACCESS_TOKEN;
++		delete process.env.BAIDU_OCR_API_KEY;
++		delete process.env.BAIDU_OCR_SECRET_KEY;
++
++		try {
++			let executedCli = "";
++			const mockExec = async (file: string) => {
++				executedCli = file;
++				return {
++					stdout: "[[[0, 0], [10, 0], [10, 10], [0, 10]], ('PaddleOCR Offline Result', 0.99)]",
++					stderr: "",
++				};
++			};
++
++			const dummyImg = new Uint8Array([1, 2, 3]);
++			const result = await tryBaiduOcr(dummyImg, { execFile: mockExec });
++
++			assert.ok(executedCli.includes("paddleocr"));
++			assert.equal(result, "PaddleOCR Offline Result");
++		} finally {
++			if (oldToken) process.env.BAIDU_OCR_ACCESS_TOKEN = oldToken;
++			if (oldKey) process.env.BAIDU_OCR_API_KEY = oldKey;
++			if (oldSec) process.env.BAIDU_OCR_SECRET_KEY = oldSec;
++		}
++	});
++
++	it("applyBaiduOcrToPdf skips OCR when all pages already contain text", async () => {
++		const pages: PdfPage[] = [
++			{ kind: "text", number: 1, markdown: "Hello world" },
++			{ kind: "text", number: 2, markdown: "Page 2 text" },
++		];
++
++		let ocrCalls = 0;
++		const result = await applyBaiduOcrToPdf(new Uint8Array([1, 2]), pages, {
++			ocrFn: async () => {
++				ocrCalls++;
++				return "OCR text";
++			},
++		});
++
++		assert.equal(ocrCalls, 0);
++		assert.equal(result.ocrCount, 0);
++		assert.deepEqual(result.pages, pages);
++	});
++
++	it("applyBaiduOcrToPdf processes image-only pages and renders via custom renderPage", async () => {
++		const pages: PdfPage[] = [
++			{ kind: "image-only", number: 1 },
++			{ kind: "text", number: 2, markdown: "Existing text" },
++		];
++
++		const rendered: number[] = [];
++		const result = await applyBaiduOcrToPdf(new Uint8Array([1, 2]), pages, {
++			renderPage: async (_pdfData, pageNum) => {
++				rendered.push(pageNum);
++				return new Uint8Array([0x89, 0x50]);
++			},
++			ocrFn: async () => "Scanned page recognized by Baidu OCR",
++		});
++
++		assert.deepEqual(rendered, [1]);
++		assert.equal(result.ocrCount, 1);
++		assert.equal(result.pages[0]!.kind, "text");
++		if (result.pages[0]!.kind === "text") {
++			assert.equal(result.pages[0]!.markdown, "Scanned page recognized by Baidu OCR");
++		}
++		assert.deepEqual(result.pages[1], pages[1]);
++	});
++
++	it("applyBaiduOcrToPdf integrates with real PDF bytes from tinyPdf and native renderer", async () => {
++		const pdf = tinyPdf([{ image: true }]);
++		const pages: PdfPage[] = [{ kind: "image-only", number: 1 }];
++
++		let receivedImageBytes = 0;
++		const result = await applyBaiduOcrToPdf(pdf, pages, {
++			ocrFn: async (img) => {
++				receivedImageBytes = img.length;
++				return "Baidu OCR text from rendered canvas";
++			},
++		});
++
++		assert.ok(receivedImageBytes > 0, "Canvas should have rendered a PNG image buffer");
++		assert.equal(result.ocrCount, 1);
++		assert.equal(result.pages[0]!.kind, "text");
++		if (result.pages[0]!.kind === "text") {
++			assert.equal(result.pages[0]!.markdown, "Baidu OCR text from rendered canvas");
++		}
++	});
++
++	it("createPluginDocumentConverter succeeds on image-only PDF when Baidu OCR is available", async () => {
++		const pages: PdfPage[] = [
++			{ kind: "image-only", number: 1 },
++			{ kind: "text", number: 2, markdown: "Second page" },
++		];
++
++		const service = createPluginDocumentConverter({
++			convertPdf: async () => ({ kind: "converted", pages }),
++			applyBaiduOcrToPdf: async (_bytes, p) => ({
++				pages: [
++					{ kind: "text", number: 1, markdown: "OCR Page 1 Content" },
++					p[1]!,
++				],
++				ocrCount: 1,
++			}),
++		});
++
++		const form = new FormData();
++		form.append("file", new File([new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d])], "scanned.pdf"));
++		const req = new Request("http://localhost/documents", { method: "POST", body: form });
++
++		const result = await service.convert(req, new AbortController().signal);
++		assert.ok(result.markdown.includes("OCR Page 1 Content"));
++		assert.ok(result.notices.includes("Processed with Baidu OCR."));
++	});
++});
+diff --git a/tests/markitdown.test.ts b/tests/markitdown.test.ts
+new file mode 100644
+index 0000000..be23642
+--- /dev/null
++++ b/tests/markitdown.test.ts
+@@ -0,0 +1,213 @@
++import assert from "node:assert/strict";
++import * as zlib from "node:zlib";
++import * as fs from "node:fs";
++import * as os from "node:os";
++import * as path from "node:path";
++import { describe, it } from "node:test";
++import {
++	convertDocx,
++	convertPdfWithMarkitdown,
++	tryConvertWithMarkitdown,
++	parseDocx,
++} from "../src/server/markitdown.ts";
++import { readTool } from "../src/agent/tools/read.ts";
++import { createPluginDocumentConverter } from "../src/server/plugin-documents.ts";
++
++function createZip(entries: Array<{ name: string; data: Buffer }>): Buffer {
++	const localHeaders: Buffer[] = [];
++	const centralHeaders: Buffer[] = [];
++	let offset = 0;
++
++	for (const { name, data } of entries) {
++		const nameBuf = Buffer.from(name, "utf8");
++		const compressed = zlib.deflateRawSync(data);
++		const local = Buffer.alloc(30 + nameBuf.length + compressed.length);
++		local.writeUInt32LE(0x04034b50, 0);
++		local.writeUInt16LE(20, 4);
++		local.writeUInt16LE(0, 6);
++		local.writeUInt16LE(8, 8);
++		local.writeUInt16LE(0, 10);
++		local.writeUInt16LE(0, 12);
++		local.writeUInt32LE(0, 14);
++		local.writeUInt32LE(compressed.length, 18);
++		local.writeUInt32LE(data.length, 22);
++		local.writeUInt16LE(nameBuf.length, 26);
++		local.writeUInt16LE(0, 28);
++		nameBuf.copy(local, 30);
++		compressed.copy(local, 30 + nameBuf.length);
++		localHeaders.push(local);
++
++		const central = Buffer.alloc(46 + nameBuf.length);
++		central.writeUInt32LE(0x02014b50, 0);
++		central.writeUInt16LE(20, 4);
++		central.writeUInt16LE(20, 6);
++		central.writeUInt16LE(0, 8);
++		central.writeUInt16LE(8, 10);
++		central.writeUInt16LE(0, 12);
++		central.writeUInt16LE(0, 14);
++		central.writeUInt32LE(0, 16);
++		central.writeUInt32LE(compressed.length, 20);
++		central.writeUInt32LE(data.length, 24);
++		central.writeUInt16LE(nameBuf.length, 28);
++		central.writeUInt16LE(0, 30);
++		central.writeUInt16LE(0, 32);
++		central.writeUInt16LE(0, 34);
++		central.writeUInt16LE(0, 36);
++		central.writeUInt32LE(0, 38);
++		central.writeUInt32LE(offset, 42);
++		nameBuf.copy(central, 46);
++		centralHeaders.push(central);
++
++		offset += local.length;
++	}
++
++	const cdOffset = offset;
++	const cdBuf = Buffer.concat(centralHeaders);
++	const cdSize = cdBuf.length;
++
++	const eocd = Buffer.alloc(22);
++	eocd.writeUInt32LE(0x06054b50, 0);
++	eocd.writeUInt16LE(0, 4);
++	eocd.writeUInt16LE(0, 6);
++	eocd.writeUInt16LE(entries.length, 8);
++	eocd.writeUInt16LE(entries.length, 10);
++	eocd.writeUInt32LE(cdSize, 12);
++	eocd.writeUInt32LE(cdOffset, 16);
++	eocd.writeUInt16LE(0, 20);
++
++	return Buffer.concat([...localHeaders, cdBuf, eocd]);
++}
++
++function sampleDocxBuffer(): Buffer {
++	const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
++            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
++            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
++  <w:body>
++    <w:p>
++      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
++      <w:r><w:t>Project Specification</w:t></w:r>
++    </w:p>
++    <w:p>
++      <w:pPr><w:pStyle w:val="Heading 2"/></w:pPr>
++      <w:r><w:t>Section 1 &amp; Overview</w:t></w:r>
++    </w:p>
++    <w:p>
++      <w:r><w:t>This is introductory text with an image.</w:t></w:r>
++      <w:drawing>
++        <a:blip r:embed="rIdDiagram"/>
++      </w:drawing>
++    </w:p>
++    <w:p>
++      <w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>
++      <w:r><w:t>First bullet item</w:t></w:r>
++    </w:p>
++    <w:p>
++      <w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="1"/></w:numPr></w:pPr>
++      <w:r><w:t>Nested bullet item</w:t></w:r>
++    </w:p>
++    <w:tbl>
++      <w:tr>
++        <w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc>
++        <w:tc><w:p><w:r><w:t>Role</w:t></w:r></w:p></w:tc>
++      </w:tr>
++      <w:tr>
++        <w:tc><w:p><w:r><w:t>Alice</w:t></w:r></w:p></w:tc>
++        <w:tc><w:p><w:r><w:t>Lead | Architect</w:t></w:r></w:p></w:tc>
++      </w:tr>
++    </w:tbl>
++  </w:body>
++</w:document>`;
++
++	const relsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
++  <Relationship Id="rIdDiagram" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/diagram.png"/>
++</Relationships>`;
++
++	return createZip([
++		{ name: "word/document.xml", data: Buffer.from(documentXml, "utf8") },
++		{ name: "word/_rels/document.xml.rels", data: Buffer.from(relsXml, "utf8") },
++	]);
++}
++
++describe("MarkItDown & DOCX integration", () => {
++	it("tryConvertWithMarkitdown returns null gracefully when MarkItDown CLI is absent or fails", async () => {
++		const dummyBytes = new Uint8Array([1, 2, 3, 4]);
++		const result = await tryConvertWithMarkitdown(dummyBytes, "test.docx");
++		// MarkItDown CLI is either not installed or cannot convert 4 dummy bytes
++		assert.equal(result, null);
++	});
++
++	it("convertPdfWithMarkitdown returns null gracefully when MarkItDown CLI is absent or fails", async () => {
++		const dummyBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d]);
++		const result = await convertPdfWithMarkitdown(dummyBytes, "test.pdf");
++		assert.equal(result, null);
++	});
++
++	it("parseDocx extracts headings, text, images, lists, and tables correctly", () => {
++		const zip = sampleDocxBuffer();
++		const markdown = parseDocx(zip);
++
++		assert.match(markdown, /^# Project Specification/m);
++		assert.match(markdown, /^## Section 1 & Overview/m);
++		assert.match(markdown, /introductory text with an image/);
++		assert.match(markdown, /!\[Image\]\(word\/media\/diagram\.png\)/);
++		assert.match(markdown, /^- First bullet item/m);
++		assert.match(markdown, /^  - Nested bullet item/m);
++		assert.match(markdown, /\| Name \| Role \|/);
++		assert.match(markdown, /\| --- \| --- \|/);
++		assert.match(markdown, /\| Alice \| Lead \\\| Architect \|/);
++	});
++
++	it("convertDocx falls back to built-in reader when MarkItDown CLI is absent", async () => {
++		const zip = sampleDocxBuffer();
++		const result = await convertDocx(zip, "sample.docx");
++
++		assert.ok(result.markdown.includes("# Project Specification"));
++		assert.ok(result.markdown.includes("![Image](word/media/diagram.png)"));
++		assert.ok(result.markdown.includes("| Name | Role |"));
++		assert.deepEqual(result.notices, [
++			"Converted with built-in DOCX reader. Install Microsoft markitdown for full AI image analysis.",
++		]);
++	});
++
++	it("convertDocx throws an error on invalid or corrupt zip buffer", async () => {
++		const invalid = new Uint8Array([1, 2, 3, 4]);
++		await assert.rejects(() => convertDocx(invalid, "broken.docx"), /Invalid archive/);
++	});
++
++	it("readTool reads and slices .docx files seamlessly", async () => {
++		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "lh-docx-test-"));
++		const docxFile = path.join(tmpDir, "report.docx");
++		fs.writeFileSync(docxFile, sampleDocxBuffer());
++
++		try {
++			const res = await readTool.execute!("test", { path: docxFile });
++			assert.ok(res.content.length >= 1);
++			const first = res.content[0];
++			assert.ok(first && typeof first === "object" && "type" in first && first.type === "text" && "text" in first && typeof first.text === "string");
++			const text = first.text;
++			assert.match(text, /# Project Specification/);
++			assert.match(text, /!\[Image\]\(word\/media\/diagram\.png\)/);
++		} finally {
++			fs.rmSync(tmpDir, { recursive: true, force: true });
++		}
++	});
++
++	it("createPluginDocumentConverter converts uploaded .docx files", async () => {
++		const converter = createPluginDocumentConverter();
++		const form = new FormData();
++		form.append("file", new File([new Uint8Array(sampleDocxBuffer())], "contract.docx", {
++			type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
++		}));
++		const request = new Request("http://localhost/documents", { method: "POST", body: form });
++		const result = await converter.convert(request, new AbortController().signal);
++
++		assert.equal(result.name, "contract.docx");
++		assert.match(result.markdown, /# Project Specification/);
++		assert.match(result.markdown, /!\[Image\]\(word\/media\/diagram\.png\)/);
++		assert.deepEqual(result.notices, [
++			"Converted with built-in DOCX reader. Install Microsoft markitdown for full AI image analysis.",
++		]);
++	});
++});
+diff --git a/tests/notes-import-queue.test.ts b/tests/notes-import-queue.test.ts
+index 3b17b40..318acc5 100644
+--- a/tests/notes-import-queue.test.ts
++++ b/tests/notes-import-queue.test.ts
+@@ -97,9 +97,9 @@ it("the queue uploads every accepted extension, including the expanded text type
+ 
+ it("the file type check comes before the size check", () => {
+ 	const queue = createNotesImportQueue(async ([f]) => [success(f!.name)]);
+-	const huge = file("huge.docx"); Object.defineProperty(huge, "size", { value: Number.MAX_SAFE_INTEGER });
++	const huge = file("huge.bin"); Object.defineProperty(huge, "size", { value: Number.MAX_SAFE_INTEGER });
+ 	queue.append([huge]);
+-	assert.deepEqual(queue.getSnapshot().errors, ["Skipped 1 file that isn't text, Markdown, or PDF (.docx)."]);
++	assert.deepEqual(queue.getSnapshot().errors, ["Skipped 1 file that isn't text, Markdown, or PDF (.bin)."]);
+ });
+ 
+ it("a folder pick of unsupported files gives one summary line with the count and each distinct type once, in first-seen order", async () => {
+diff --git a/tests/notes-import-route.test.ts b/tests/notes-import-route.test.ts
+index 97942e6..ba30838 100644
+--- a/tests/notes-import-route.test.ts
++++ b/tests/notes-import-route.test.ts
+@@ -158,9 +158,9 @@ it("an off-list type and a non-text file are refused with a short message before
+ 		const zip = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x00]);
+ 		const { results } = await (await POST(upload([{ name: "deck.pptx", bytes: "plain words" }, { name: "slides.pptx", bytes: pdf }, { name: "notes.txt", bytes: zip }]))).json();
+ 		assert.deepEqual(results.map((r: { filePath: string; ok: boolean; outcome: string; error: string }) => [r.filePath, r.ok, r.outcome, r.error]).sort(), [
+-			["deck.pptx", false, "failed", "This file type isn't supported. Use text, Markdown, or PDF."],
++			["deck.pptx", false, "failed", "This file type isn't supported. Use text, Markdown, PDF, or DOCX."],
+ 			["notes.txt", false, "failed", "This file isn't plain text."],
+-			["slides.pptx", false, "failed", "This file type isn't supported. Use text, Markdown, or PDF."],
++			["slides.pptx", false, "failed", "This file type isn't supported. Use text, Markdown, PDF, or DOCX."],
+ 		]);
+ 		assert.equal(imports, 0); assert.deepEqual(registered, []);
+ 	} finally { sourceDirectory.registerImport = realRegister; }
+diff --git a/tests/notes-import.test.tsx b/tests/notes-import.test.tsx
+index 4ef16ae..5bbae7e 100644
+--- a/tests/notes-import.test.tsx
++++ b/tests/notes-import.test.tsx
+@@ -146,12 +146,13 @@ it("25 MiB is per file, not per selection; oversized files fail locally while sm
+ });
+ it("picker stays enabled during imports, offers Files/Folder, and keeps PDF support", () => {
+ 	const html = renderToStaticMarkup(<NotesImportControl importing onImportFiles={() => {}} />);
+-	assert.match(html, /webkitdirectory/); assert.match(html, /accept=".txt,.md,.markdown,.rst,.org,.adoc,.tex,.pdf"/); assert.doesNotMatch(html, /disabled/);
++	assert.match(html, /webkitdirectory/); assert.match(html, /accept=".txt,.md,.markdown,.rst,.org,.adoc,.tex,.pdf,.docx"/); assert.doesNotMatch(html, /disabled/);
+ });
+ it("the Files picker's accept lists only types the queue takes, in any letter case", () => {
+ 	const accepted = renderToStaticMarkup(<NotesImportControl importing={false} onImportFiles={() => {}} />).match(/accept="([^"]*)"/)![1]!.split(",");
+ 	for (const extension of accepted) assert.ok(IMPORT_EXTENSIONS.test(`NOTES${extension.toUpperCase()}`), extension);
+-	assert.ok(!IMPORT_EXTENSIONS.test("README") && !IMPORT_EXTENSIONS.test("notes.md.bak") && !IMPORT_EXTENSIONS.test("notes.docx"));
++	assert.ok(!IMPORT_EXTENSIONS.test("README") && !IMPORT_EXTENSIONS.test("notes.md.bak") && !IMPORT_EXTENSIONS.test("notes.pptx"));
++	assert.ok(IMPORT_EXTENSIONS.test("notes.docx"));
+ });
+ it("graph menu clearly distinguishes extraction from lesson material, above unchanged Files/Folder choices", async () => {
+ 	const selected: unknown[] = [];
+-- 
+2.53.0.windows.1
+

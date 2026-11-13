@@ -1,7 +1,7 @@
 From 33c9d3e9d4e0b610800a7040721e41380aab051b Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 29 Oct 2026 15:31:39 +0800
-Subject: [PATCH 05/12] docs: document custom prompt segments and context
+Subject: [PATCH 05/14] docs: document custom prompt segments and context
  pointers
 
 ---

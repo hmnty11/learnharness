@@ -1,7 +1,7 @@
 From 61c6a9970814b87c9c8fbf78913cbc955c6f0e55 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 29 Oct 2026 15:31:35 +0800
-Subject: [PATCH 04/12] feat(ui): add Personalization & Skills management to
+Subject: [PATCH 04/14] feat(ui): add Personalization & Skills management to
  Agent settings
 
 ---
