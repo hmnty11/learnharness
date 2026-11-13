@@ -1,7 +1,7 @@
 From 55b630e183dc139b92a27d8a31dddb4f3a2f8218 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Mon, 2 Nov 2026 11:24:00 +0800
-Subject: [PATCH 06/17] feat(tooling): add upstream patch sync workflow and
+Subject: [PATCH 06/18] feat(tooling): add upstream patch sync workflow and
  modular patches
 
 ---

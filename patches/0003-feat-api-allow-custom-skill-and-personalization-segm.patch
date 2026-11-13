@@ -1,7 +1,7 @@
 From 6100e9b22e7d5f8263ea161633d0793977363830 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 29 Oct 2026 15:31:29 +0800
-Subject: [PATCH 03/17] feat(api): allow custom skill and personalization
+Subject: [PATCH 03/18] feat(api): allow custom skill and personalization
  segment updates
 
 ---

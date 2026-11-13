@@ -1,7 +1,7 @@
 From 97b0dda3da06416bf48dd9165b819e9561db7c00 Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 12 Nov 2026 08:57:32 +0800
-Subject: [PATCH 10/17] fix(providers): exclude 9router from zero-cost estimate
+Subject: [PATCH 10/18] fix(providers): exclude 9router from zero-cost estimate
  and honor fresh-user policy
 
 ---

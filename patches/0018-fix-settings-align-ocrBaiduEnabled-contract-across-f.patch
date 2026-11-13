@@ -1,0 +1,84 @@
+From de698f74c8cb8a81546374b306378f7287a16dac Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Fri, 13 Nov 2026 15:43:23 +0800
+Subject: [PATCH 18/18] fix(settings): align ocrBaiduEnabled contract across
+ factory and resolution tests
+
+---
+ src/core/settings-resolution.ts   | 2 +-
+ src/core/settings.ts              | 2 +-
+ tests/settings-resolution.test.ts | 6 +++---
+ tests/settings.test.ts            | 2 +-
+ 4 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/settings-resolution.ts b/src/core/settings-resolution.ts
+index 6cedb6b..abd35b5 100644
+--- a/src/core/settings-resolution.ts
++++ b/src/core/settings-resolution.ts
+@@ -240,7 +240,7 @@ export function resolveSettings(record: UserSettings | null): EffectiveSettings
+ 			// (pre-redesign record, fresh install) resolves to the factory
+ 			// 4096; the sanitizer has already clamped/floored any stored value.
+ 			extractionChunkTokens: graph.extractionChunkTokens ?? FACTORY_SETTINGS.graph.extractionChunkTokens,
+-			...(graph.ocrBaiduEnabled !== undefined ? { ocrBaiduEnabled: graph.ocrBaiduEnabled } : {}),
++			ocrBaiduEnabled: graph.ocrBaiduEnabled ?? FACTORY_SETTINGS.graph.ocrBaiduEnabled,
+ 		},
+ 		compaction: {
+ 			thresholdTokens: record?.compaction?.thresholdTokens ?? FACTORY_SETTINGS.compaction.thresholdTokens,
+diff --git a/src/core/settings.ts b/src/core/settings.ts
+index 4781d13..75f0863 100644
+--- a/src/core/settings.ts
++++ b/src/core/settings.ts
+@@ -555,7 +555,7 @@ export const FACTORY_SETTINGS: FactorySettings = {
+ 		sessionNameSerif: true,
+ 		mdRendering: { headingWeight: 900, boldColor: null, italicColor: null },
+ 	},
+-	graph: { enabled: true, rendering: true, extractionChunkTokens: 4096 },
++	graph: { enabled: true, rendering: true, extractionChunkTokens: 4096, ocrBaiduEnabled: false },
+ 	compaction: { thresholdTokens: 150_000, includeReasoning: false },
+ };
+ 
+diff --git a/tests/settings-resolution.test.ts b/tests/settings-resolution.test.ts
+index a53b8be..059a9b8 100644
+--- a/tests/settings-resolution.test.ts
++++ b/tests/settings-resolution.test.ts
+@@ -60,7 +60,7 @@ describe("resolveSettings", () => {
+ 		// wave 7 collapse: the master switch ONLY + the redesign's chunk
+ 		// budget — absent record resolves the factory 4096 (halved back
+ 		// from the digest-era 8192, owner, 2026-10-13)
+-		assert.deepEqual(eff.graph, { enabled: true, rendering: true, extractionChunkTokens: 4096 });
++		assert.deepEqual(eff.graph, { enabled: true, rendering: true, extractionChunkTokens: 4096, ocrBaiduEnabled: false });
+ 	});
+ 
+ 	it("explicit record values win over every factory default", () => {
+@@ -94,13 +94,13 @@ describe("resolveSettings", () => {
+ 		assert.equal(eff.appearance.mdRendering.headingWeight, 600);
+ 		// wave 7 collapse: the section IS the master switch (absent budget
+ 		// field = factory 4096 — a pre-redesign record resolves cleanly).
+-		assert.deepEqual(eff.graph, { enabled: false, rendering: true, extractionChunkTokens: 4096 });
++		assert.deepEqual(eff.graph, { enabled: false, rendering: true, extractionChunkTokens: 4096, ocrBaiduEnabled: false });
+ 		// The DISPLAY split (owner, 2026-10-06): extraction off leaves the
+ 		// rendering switch ON — the data channel and the view are separate.
+ 		assert.equal(renderingEnabled(eff.graph), true);
+ 		// The chunk budget rides the same resolution: stored value wins.
+ 		const budgeted = resolveSettings({ version: 1, graph: { extractionChunkTokens: 2000 } });
+-		assert.deepEqual(budgeted.graph, { enabled: true, rendering: true, extractionChunkTokens: 2000 });
++		assert.deepEqual(budgeted.graph, { enabled: true, rendering: true, extractionChunkTokens: 2000, ocrBaiduEnabled: false });
+ 	});
+ 
+ 	it("graph rendering (2026-10-06): display-only — off resolves off, extraction untouched", () => {
+diff --git a/tests/settings.test.ts b/tests/settings.test.ts
+index bcef638..93a85d1 100644
+--- a/tests/settings.test.ts
++++ b/tests/settings.test.ts
+@@ -26,7 +26,7 @@ describe("FACTORY_SETTINGS (the compiled factory layer)", () => {
+ 		// redesign's chunk budget (2026-09-24); doubled to 8192 with the
+ 		// digest-aware redesign (2026-09-30), then HALVED BACK to 4096
+ 		// with the message anchors (owner, 2026-10-13)
+-		assert.deepEqual(FACTORY_SETTINGS.graph, { enabled: true, rendering: true, extractionChunkTokens: 4096 });
++		assert.deepEqual(FACTORY_SETTINGS.graph, { enabled: true, rendering: true, extractionChunkTokens: 4096, ocrBaiduEnabled: false });
+ 		const a = FACTORY_SETTINGS.appearance;
+ 		assert.equal(a.theme, "default");
+ 		assert.equal(a.background, null); // the theme's own background, not a factory hex
+-- 
+2.53.0.windows.1
+

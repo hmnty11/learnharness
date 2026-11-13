@@ -1,7 +1,7 @@
 From b0101d67c5fdc17d5627e087914a0e115031c37c Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Fri, 13 Nov 2026 15:39:48 +0800
-Subject: [PATCH 17/17] fix(settings): preserve factory graph shape and align
+Subject: [PATCH 17/18] fix(settings): preserve factory graph shape and align
  extraction contract
 
 ---

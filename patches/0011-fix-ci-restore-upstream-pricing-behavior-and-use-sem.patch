@@ -1,7 +1,7 @@
 From 7d45fe6f52c4bf8788b657fad062d4cd7703341a Mon Sep 17 00:00:00 2001
 From: hmty11 <darrenjeho@gmail.com>
 Date: Thu, 12 Nov 2026 09:16:52 +0800
-Subject: [PATCH 11/17] fix(ci): restore upstream pricing behavior and use
+Subject: [PATCH 11/18] fix(ci): restore upstream pricing behavior and use
  semantic error token in agent section
 
 ---
