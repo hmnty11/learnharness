@@ -1,0 +1,1603 @@
+From 65b66112745640a979427ee60aec8062395eb4ed Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Wed, 18 Nov 2026 10:54:20 +0800
+Subject: [PATCH 19/19] feat(notes): resume imports and filter PDF navigation
+ pages
+
+Persist incomplete notes-import checkpoints and skip completed leading chunks on identical retries.
+Filter table-of-contents and index PDF pages before extraction.
+Validate fetch DNS candidates and literals on Windows; make test fixtures portable without weakening supported security assertions.
+---
+ app/api/graph/import/route.ts             |   9 +-
+ docs/architecture.md                      |   6 +-
+ docs/development.md                       |   2 +
+ docs/plugin-api/README.md                 |   2 +-
+ docs/plugin-api/contracts-graph.md        |  43 ++++++
+ src/agent/subagents/extraction.ts         |  40 +++++-
+ src/agent/subagents/pdf-markdown.ts       |  43 ++++++
+ src/agent/tools/safe-fetch.ts             |  43 ++++--
+ src/core/contracts/graph.ts               |   6 +
+ src/server/index.ts                       |   2 +-
+ tests/appearance-chrome.test.ts           |   2 +-
+ tests/auth-store.test.ts                  |   8 +-
+ tests/automatic-updates.test.ts           |   2 +-
+ tests/chatgpt-auth.test.ts                |  10 +-
+ tests/claude-code-stream.test.ts          |   7 +-
+ tests/code-ligatures.test.tsx             |   4 +-
+ tests/core-plugin-build.test.ts           |   4 +-
+ tests/core-plugins.test.ts                |  10 +-
+ tests/data-dir-seam.test.ts               |   8 +-
+ tests/desktop-platform.test.ts            |   4 +-
+ tests/extraction-resume.test.ts           | 158 ++++++++++++++++++++++
+ tests/file-access-settings.test.ts        |   8 +-
+ tests/helpers/plugin-authoring-fixture.ts |   2 +-
+ tests/learner-image-snapshots.test.ts     |   5 +-
+ tests/model-catalog.test.ts               |   5 +-
+ tests/pdf-content-filter.test.ts          |  39 ++++++
+ tests/plugin-api-reference.test.ts        |  12 +-
+ tests/plugin-authoring-bundle.test.ts     |  22 ++-
+ tests/plugin-document-types.test.ts       |   5 +-
+ tests/plugin-grading-types.test.ts        |   5 +-
+ tests/plugin-host.test.ts                 |  14 +-
+ tests/plugin-install-local.test.ts        |  36 +++--
+ tests/plugin-problem-types.test.ts        |   5 +-
+ tests/plugin-question-types.test.ts       |   5 +-
+ tests/plugin-submission-types.test.ts     |   5 +-
+ tests/plugin-task-records.test.ts         |  13 +-
+ tests/plugin-types.test.ts                |   5 +-
+ tests/plugin-view-types.test.ts           |   5 +-
+ tests/session-identity.test.ts            |   4 +-
+ tests/source-access.test.ts               |  98 +++++++++-----
+ tests/subscription-auth.test.ts           |   2 +-
+ tests/themes.test.ts                      |   2 +-
+ tests/verify-release.test.ts              |   4 +-
+ 43 files changed, 587 insertions(+), 127 deletions(-)
+ create mode 100644 tests/extraction-resume.test.ts
+ create mode 100644 tests/pdf-content-filter.test.ts
+
+diff --git a/app/api/graph/import/route.ts b/app/api/graph/import/route.ts
+index c5d561f..a7d4438 100644
+--- a/app/api/graph/import/route.ts
++++ b/app/api/graph/import/route.ts
+@@ -20,7 +20,7 @@
+  * healthy. The dock's chips + graph refetch track progress live through
+  * /api/graph/status, as with session runs.
+  */
+-import { applyBaiduOcrToPdf, cleanRepeatingHeadersFooters, convertDocx, convertPdf, convertPdfWithMarkitdown, extraction, joinPages, NotesImportError, readSettingsRecord, sourceDirectory } from "@/src/server";
++import { applyBaiduOcrToPdf, cleanRepeatingHeadersFooters, convertDocx, convertPdf, convertPdfWithMarkitdown, extraction, filterNonContentPages, joinPages, NotesImportError, readSettingsRecord, sourceDirectory } from "@/src/server";
+ import { IMPORT_EXTENSIONS, MAX_IMPORT_BODY_BYTES, MAX_IMPORT_BYTES, UNSUPPORTED_TYPE_MESSAGE, validNotesPath } from "@/lib/notes-import-limits.ts";
+ import { FormBodyLimitError, readBoundedFormData } from "@/lib/bounded-form-data.ts";
+ import {
+@@ -95,11 +95,16 @@ async function readNotesFile(file: File, ocrEnabled: boolean = false): Promise<N
+ 				}
+ 			}
+ 			pages = cleanRepeatingHeadersFooters(pages);
++			const filtered = filterNonContentPages(pages);
++			pages = filtered.pages;
+ 			const text = joinPages(pages);
+ 			if (!text) return { kind: "refused", error: "OCR not supported yet." };
+ 			const skipped = pages.filter((page) => page.kind === "image-only").length;
+ 			const omission = skipped > 0 ? ` Skipped ${skipped} image-only ${skipped === 1 ? "page" : "pages"}; OCR is not supported.` : "";
+-			return { kind: "notes", text, notice: `Scanned pages may have errors.${omission}${ocrNotice}` };
++			const navigation = filtered.skippedCount > 0
++				? ` Skipped ${filtered.skippedCount} ${filtered.skippedTypes.join("/")} ${filtered.skippedCount === 1 ? "page" : "pages"}.`
++				: "";
++			return { kind: "notes", text, notice: `Scanned pages may have errors.${omission}${navigation}${ocrNotice}` };
+ 		}
+ 	}
+ }
+diff --git a/docs/architecture.md b/docs/architecture.md
+index c343a2b..5d81013 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -126,9 +126,9 @@ The [extractor](../src/agent/subagents/extraction.ts) reads source text and prop
+ 
+ ### Notes and source organization
+ 
+-`POST /api/graph/import` feeds text or locally converted PDF Markdown into the same pipeline, without chat-message anchors. Before source registration or extraction, the route enforces the shared filename-extension list, recognizes PDFs by their `%PDF-` header, and refuses other files containing a zero byte in the first 8 KiB. Non-PDF files are decoded as UTF-8; the zero-byte rule is a limited binary-file heuristic, not complete text or encoding validation. The [import UI](../components/notes-import.tsx) queues one request per supported file, up to three in flight. Files are capped at 25 MiB; server aggregate file bytes per request are also capped at 25 MiB, with a 26 MiB multipart/proxy bound. PDF conversion has no OCR; skipped image-only pages and scanner caveats are reported.
++`POST /api/graph/import` feeds text or locally converted PDF Markdown into the same pipeline, without chat-message anchors. Before source registration or extraction, the route enforces the shared filename-extension list, recognizes PDFs by their `%PDF-` header, and refuses other files containing a zero byte in the first 8 KiB. Non-PDF files are decoded as UTF-8; the zero-byte rule is a limited binary-file heuristic, not complete text or encoding validation. The [import UI](../components/notes-import.tsx) queues one request per supported file, up to three in flight. Files are capped at 25 MiB; server aggregate file bytes per request are also capped at 25 MiB, with a 26 MiB multipart/proxy bound. PDF text comes from pdfjs (page Markdown) or MarkItDown; `.docx` files are converted with a Node DOCX reader. Image-only pages are reported and skipped unless the opt-in Baidu OCR switch is on, in which case PaddleOCR (local CLI) or the Baidu Cloud API fills just those pages; scanner caveats are still reported.
+ 
+-Source identity hashes the original path/name; safe folder-relative paths can be supplied alongside matching filenames. Renaming or reorganizing a displayed source does not change its identity. Every explicit import processes the whole file, even unchanged text; retry is not exactly-once processing. Same-source overlap is refused as busy. Per-file outcomes distinguish completed, partial, failed, aborted, and busy; zero findings can still be a completed import.
++Source identity hashes the original path/name; safe folder-relative paths can be supplied alongside matching filenames. Renaming or reorganizing a displayed source does not change its identity. PDF pages that are navigational back/front matter (a table-of-contents or index heading whose body is mostly entry lines) are dropped before joining, so they cost no extractor calls; an ambiguous page is kept. A completed import still processes the whole file, even unchanged text, and retry is not exactly-once processing. A stopped run is the one exception: `NotesSource.resume` records the chunking inputs' fingerprint and the leading chunks already merged, so re-uploading the same text at the same chunk budget resumes at the first unfinished chunk. A different text or chunk budget changes the fingerprint and starts from chunk 1; completing the run clears the checkpoint. Same-source overlap is refused as busy. Per-file outcomes distinguish completed, partial, failed, aborted, and busy; zero findings can still be a completed import.
+ 
+ `graph/source-organization.json` holds display overrides and folder placement, not original file contents. Folder imports reconstruct directories containing supported files. Organization is separate from session-sidebar placement. Both the chains browser and practice’s node picker hide practice-session source rows; this is a read projection, not deletion of conversations, graph contributions or placements. Folder selection excludes those hidden sources. Empty source names are muted in place, using full contents rather than search-filtered counts. Ordinary chains-view selection selects sources/folders, including descendants hidden by search; practice can select finer-grained graph material.
+ 
+@@ -179,6 +179,8 @@ The **sensitive-path guard** refuses known private home locations, `.env` files,
+ 
+ File/PDF/visual images share image postprocessing. Search supports Tavily, Brave, Exa, Firecrawl, and hosted Ollama adapters; page fetching is independent and does not need a search key. Dictation mints short-lived tokens server-side and streams audio browser → Deepgram. These external effects are not isolated by a scratch data directory alone.
+ 
++Research page/PDF fetches validate IP literals and every DNS candidate before connecting, then recheck the reported peer when available. Each new connection resolves and validates again; redirects pass through the same guard. This avoids relying on `remoteAddress`, which can be empty for configured sockets on Windows, without permitting private DNS results. TLS certificate and hostname validation remain enabled.
++
+ ## Trusted local plugins (API v1)
+ 
+ The [plugin architecture](plugin-architecture.md) specifies the runtime and [authoring guide](plugin-authoring.md) documents its public contract. Plugins are optional, disabled by default, and trusted like other local programs: no sandbox or permission fiction. Core and community packages use the same context API. The app loads its four catalog-selected core packages directly from app `core-plugins/<id>/`; writable core records live in `<learning data>/core-plugin-data/<id>/`. Community workspaces under `<learning data>/plugins/<id>/` load their manifest, browser module, Node backend and CSS/assets from fixed `dist/`, with optional source and persistent sibling `data/`. Core IDs are reserved: conflicting community copies are skipped with a visible diagnostic, not loaded or deleted. Existing explicit enable/disable choices survive app updates; startup never copies core code into user data or migrates old development records. The backend runs inside the existing Next Node server; disable is cooperative.
+diff --git a/docs/development.md b/docs/development.md
+index a217543..3e31f3d 100644
+--- a/docs/development.md
++++ b/docs/development.md
+@@ -114,6 +114,8 @@ npm run build          # Next production build
+ 
+ The suite requires no paid models or real sign-in. Some tests use temporary files, native processes, or local fake endpoints: deterministic does not mean every test is pure or cannot bind a loopback port. Inspect focused-suite setup before running beside a live app.
+ 
++On Windows, use Node 26 and run `NODE_ENV=test npx tsx --test "tests/*.test.ts" "tests/*.test.tsx"` from Git Bash; `npm test` uses POSIX environment-variable syntax. Symlink tests skip when the OS denies link creation. POSIX permission-bit and signal-escalation assertions run only where supported; file contents and cleanup still run on Windows. Generated Markdown comparisons ignore CRLF checkout differences.
++
+ [Golden fixtures](../tests/fixtures/golden-data/README.md) exercise saved records through production paths. Keep compatibility expectations with intentional format changes; do not hand-edit fixture content to make tests pass. [Standalone skill-reader tests](../tests/skills/README.md) run separately with Python and no app runtime.
+ 
+ Additional runtime gates have prerequisites:
+diff --git a/docs/plugin-api/README.md b/docs/plugin-api/README.md
+index d0ba8d2..9ce72c1 100644
+--- a/docs/plugin-api/README.md
++++ b/docs/plugin-api/README.md
+@@ -256,4 +256,4 @@ These are reachable through public data, event, inheritance or helper-type relat
+ 
+ Standard JavaScript/DOM types (`Promise`, `AbortSignal`, `File`, `HTMLElement`, and utility types) use their standard contracts. Pi model/messages/tools and TypeBox schemas use the exact peer versions declared by the bundled SDK's `package.json`. Supply those peers when typechecking; they are development types, not permission to import private LearnHarness runtime modules.
+ 
+-Coverage: **140 public types**, **57 supporting declarations**, **894 declared member signatures/variants**. Generation contains no build timestamps or absolute source paths.
++Coverage: **140 public types**, **57 supporting declarations**, **898 declared member signatures/variants**. Generation contains no build timestamps or absolute source paths.
+diff --git a/docs/plugin-api/contracts-graph.md b/docs/plugin-api/contracts-graph.md
+index f150367..9697279 100644
+--- a/docs/plugin-api/contracts-graph.md
++++ b/docs/plugin-api/contracts-graph.md
+@@ -517,6 +517,11 @@ export interface NotesSource {
+     filePath: string;
+     importedAt: string;
+     contentFp?: string;
++    resume?: {
++        fp: string;
++        chunks: number;
++        done: number;
++    };
+     extractions?: ExtractionRunUsage[];
+ }
+ ```
+@@ -529,6 +534,10 @@ export interface NotesSource {
+ - [filePath](#notessource-filepath)
+ - [importedAt](#notessource-importedat)
+ - [contentFp](#notessource-contentfp)
++- [resume](#notessource-resume)
++- [resume.fp](#notessource-resumefp)
++- [resume.chunks](#notessource-resumechunks)
++- [resume.done](#notessource-resumedone)
+ - [extractions](#notessource-extractions)
+ 
+ ### NotesSource id
+@@ -561,6 +570,40 @@ imports do not compute or write this field. No migration is needed.
+ contentFp?: string;
+ ```
+ 
++### NotesSource resume
++
++Incomplete-run checkpoint: the chunking inputs' fingerprint plus the
++leading chunks already merged. Written after each merged chunk and
++cleared when a run completes, so a stopped import of the same file
++text resumes at `done` instead of re-paying earlier chunks. A changed
++file (or chunk size) has a different fp and starts from the top.
++
++```ts
++resume?: {
++    fp: string;
++    chunks: number;
++    done: number;
++};
++```
++
++### NotesSource resume.fp
++
++```ts
++fp: string;
++```
++
++### NotesSource resume.chunks
++
++```ts
++chunks: number;
++```
++
++### NotesSource resume.done
++
++```ts
++done: number;
++```
++
+ ### NotesSource extractions
+ 
+ The run's usage log — same append-only discipline as
+diff --git a/src/agent/subagents/extraction.ts b/src/agent/subagents/extraction.ts
+index b3a7573..49279d8 100644
+--- a/src/agent/subagents/extraction.ts
++++ b/src/agent/subagents/extraction.ts
+@@ -1363,8 +1363,20 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 			// (same doctrine as chat batches).
+ 			const chunkTokens = deps.getChunkTokens?.() ?? FACTORY_SETTINGS.graph.extractionChunkTokens;
+ 			const chunks = chunkNotes(input.text, chunkTokens);
++			// RESUMABLE (owner, 2026-11-13): a stopped import of the same text at
++			// the same chunk budget resumes at the first chunk that never merged.
++			// The fingerprint covers every chunking input, so changed content
++			// (fresh OCR, edited text) starts from the top rather than splicing
++			// two different documents together.
++			const fp = crypto.createHash("sha256").update(`${chunkTokens}\n${input.text}`).digest("hex").slice(0, 32);
++			const prevResume = graphStore.readSources().find((source) => source.id === id)?.resume;
++			const resumeFrom = prevResume && prevResume.fp === fp && prevResume.chunks === chunks.length
++				&& prevResume.done > 0 && prevResume.done < chunks.length
++				? prevResume.done
++				: 0;
+ 			console.info(
+-				`[extraction ${id}] notes pipeline start (${input.filePath}) — ${chunks.length} chunk(s) of ≤${chunkTokens} tok`,
++				`[extraction ${id}] notes pipeline start (${input.filePath}) — ${chunks.length} chunk(s) of ≤${chunkTokens} tok` +
++					(resumeFrom > 0 ? `, resuming after ${resumeFrom} merged chunk(s)` : ""),
+ 			);
+ 			// PER-CHUNK JOBS (owner, 2026-09-28), SERIALIZED PER SOURCE (owner,
+ 			// 2026-09-30 evening): same law as the chat door — chunks run
+@@ -1375,7 +1387,11 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 			// part rides the registry entry (feed suffix "· i/N") only when
+ 			// the file actually chunked.
+ 			const settled: PromiseSettledResult<EmissionStats>[] = [];
++			// Leading chunks that have ever merged for this fingerprint — the
++			// resume point only advances across a failed chunk, never past it.
++			let completedPrefix = resumeFrom;
+ 			for (const [chunkIndex, chunk] of chunks.entries()) {
++				if (chunkIndex < resumeFrom) continue;
+ 				const part = chunks.length > 1 ? { i: chunkIndex + 1, n: chunks.length } : undefined;
+ 				// Keep the actual signal after runJob tears down its registry row:
+ 				// usage persistence can throw and mask the body's AbortError.
+@@ -1411,6 +1427,18 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 								// snapshot fetch reflects every finished chunk.
+ 								settleGraphLayout(graphStore);
+ 								console.info(`[extraction ${jobKey}] merged: ${merged.nodes} nodes, ${merged.chains ?? 0} chains`);
++								// Checkpoint AFTER the merge landed: a crash or stop
++								// between chunks then costs at most one re-extracted
++								// chunk, never the whole file.
++								if (chunkIndex === completedPrefix) {
++									completedPrefix = chunkIndex + 1;
++									graphStore.upsertSource({
++										id,
++										filePath: input.filePath,
++										importedAt: input.importedAt,
++										resume: { fp, chunks: chunks.length, done: completedPrefix },
++									});
++								}
+ 								return merged;
+ 							});
+ 						}),
+@@ -1435,12 +1463,15 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 			// Completion is a chunk-status contract, never a node-count test.
+ 			// Zero findings (and an empty file after the readiness gate) are valid.
+ 			const rejected = settled.filter((r) => r.status === "rejected");
+-			if (rejected.length > 0 || settled.length !== chunks.length) {
++			if (rejected.length > 0 || settled.length + resumeFrom !== chunks.length) {
+ 				const aborted = rejected.some((r) => r.reason instanceof Error && r.reason.name === "AbortError");
+ 				const outcome = aborted ? "aborted" : settled.some((r) => r.status === "fulfilled") ? "partial" : "failed";
+ 				const details = rejected.map((r) => r.reason instanceof Error ? r.reason.message : String(r.reason)).join("; ");
+ 				throw new NotesImportError(outcome, mergedStats, details || "Notes import did not complete");
+ 			}
++			// Completed: the checkpoint has no further use. Another explicit
++			// import of this file processes it whole, as before.
++			graphStore.upsertSource({ id, filePath: input.filePath, importedAt: input.importedAt });
+ 			console.info(
+ 				`[extraction ${id}] merged: ${stats.nodes} nodes, ${stats.chains ?? 0} chains ` +
+ 					`(${Math.round(performance.now() - t0)}ms total, ${chunks.length} chunk job(s))`,
+@@ -1465,7 +1496,10 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 		inFlight.add(id);
+ 		try {
+ 			const importedAt = new Date().toISOString();
+-			graphStore.upsertSource({ id, filePath: input.filePath, importedAt });
++			// Carry any incomplete-run checkpoint through the metadata upsert —
++			// otherwise re-uploading the stopped file would silently restart it.
++			const resume = graphStore.readSources().find((source) => source.id === id)?.resume;
++			graphStore.upsertSource({ id, filePath: input.filePath, importedAt, ...(resume ? { resume } : {}) });
+ 			return await runNotesExtraction({ id, ...input, importedAt });
+ 		} catch (err) {
+ 			if (err instanceof NotesImportError || err instanceof ModelsNotConfiguredError || err instanceof ProviderKeyMissingError) throw err;
+diff --git a/src/agent/subagents/pdf-markdown.ts b/src/agent/subagents/pdf-markdown.ts
+index e792426..07ebf4a 100644
+--- a/src/agent/subagents/pdf-markdown.ts
++++ b/src/agent/subagents/pdf-markdown.ts
+@@ -344,3 +344,46 @@ export function cleanRepeatingHeadersFooters(pages: readonly PdfPage[]): PdfPage
+ export function joinPages(pages: readonly PdfPage[]): string {
+ 	return pages.flatMap((p) => (p.kind === "text" ? [`--- Page ${p.number} ---\n\n${p.markdown}`] : [])).join("\n\n");
+ }
++
++const CONTENTS_HEADING = /^(?:table\s+of\s+)?(?:contents|daftar\s+isi|inhalt|sommaire|índice|indice)$/i;
++const INDEX_HEADING = /^(?:index|indeks|stichwortverzeichnis|index\s+des\s+termes)$/i;
++/** A dot-leader / whitespace-padded TOC entry ending in a page number. */
++const CONTENTS_ENTRY = /^.{2,80}?(?:\.{2,}|…{2,}|\s{2,})\s*(?:\d{1,4}|[ivxlcdm]{1,7})$/i;
++/** A back-of-book index reference: `term, 12` / `term 12, 14, 99`. */
++const INDEX_ENTRY = /^\s*[^,]{2,60},\s*\d{1,4}(?:\s*[-,–]\s*\d{1,4})?(?:\s*,\s*\d{1,4})*\s*$/;
++
++/**
++ * Drops navigational front/back matter (table of contents, index) that would
++ * otherwise cost extractor+auditor calls for propositions the book already
++ * states. Conservative: a page is only dropped when its heading matches AND
++ * most of its body looks like entries; anything ambiguous is kept.
++ */
++export function filterNonContentPages(pages: readonly PdfPage[]): { pages: PdfPage[]; skippedCount: number; skippedTypes: ("contents" | "index")[] } {
++	const kept: PdfPage[] = [];
++	const skippedTypes: ("contents" | "index")[] = [];
++	let skippedCount = 0;
++	for (const page of pages) {
++		if (page.kind !== "text") {
++			kept.push(page);
++			continue;
++		}
++		const lines = page.markdown.split("\n").map((l) => l.trim()).filter(Boolean);
++		const heading = lines[0] ?? "";
++		const body = lines.slice(1);
++		const contents = CONTENTS_HEADING.test(heading.replace(/^#+\s*/, ""))
++			&& body.length >= 3
++			&& body.filter((l) => CONTENTS_ENTRY.test(l)).length * 2 >= body.length;
++		const index = !contents
++			&& INDEX_HEADING.test(heading.replace(/^#+\s*/, ""))
++			&& body.length >= 3
++			&& body.filter((l) => INDEX_ENTRY.test(l)).length * 2 >= body.length;
++		if (!contents && !index) {
++			kept.push(page);
++			continue;
++		}
++		skippedCount++;
++		const kind = contents ? "contents" : "index";
++		if (!skippedTypes.includes(kind)) skippedTypes.push(kind);
++	}
++	return { pages: kept, skippedCount, skippedTypes };
++}
+diff --git a/src/agent/tools/safe-fetch.ts b/src/agent/tools/safe-fetch.ts
+index cd544fb..a4b9975 100644
+--- a/src/agent/tools/safe-fetch.ts
++++ b/src/agent/tools/safe-fetch.ts
+@@ -1,4 +1,5 @@
+-import { BlockList, isIP } from "node:net";
++import { lookup as dnsLookup } from "node:dns";
++import { BlockList, isIP, type LookupFunction } from "node:net";
+ import { Agent, buildConnector, fetch as undiciFetch } from "undici";
+ 
+ /**
+@@ -63,20 +64,43 @@ export function createAddressCheckedAgent(
+ 	allowed: (address: string) => boolean = isPublicAddress,
+ 	connectorOptions: Parameters<typeof buildConnector>[0] = {},
+ ): Agent {
+-	// Optional connector settings let offline tests supply deterministic DNS and
+-	// a synthetic TLS CA. Production uses the standard connector unchanged.
+-	const connect = buildConnector(connectorOptions);
++	// Connector settings let offline tests supply deterministic DNS and a TLS CA.
++	const refused = (hostname: string) => new BlockedAddressError(`refusing to connect to a private or local address (${hostname})`);
++	const resolve: LookupFunction = connectorOptions && "lookup" in connectorOptions ? connectorOptions.lookup ?? dnsLookup : dnsLookup;
++	// undici calls setNoDelay/setKeepAlive on the pending socket before it
++	// resolves; on Windows that leaves remoteAddress empty even for a connected
++	// socket. Judge the address where it is chosen instead: every address the
++	// resolver returns is checked before the connection is attempted.
++	const lookup: LookupFunction = (hostname, options, callback) => {
++		resolve(hostname, options, (error, address, family) => {
++			if (error) return callback(error, address ?? "", family);
++			const blocked = Array.isArray(address) ? address.some(entry => !allowed(entry.address)) : !allowed(address);
++			return blocked ? callback(refused(hostname), "", undefined) : callback(null, address, family);
++		});
++	};
++	const connect = buildConnector({ ...connectorOptions, lookup });
+ 	return new Agent({
+ 		connect: (options, callback) => {
++			if (connectorOptions && (("socketPath" in connectorOptions && connectorOptions.socketPath) || ("path" in connectorOptions && connectorOptions.path))) {
++				callback(refused(options.hostname), null);
++				return;
++			}
++			// A literal IP never reaches the resolver, so judge it here.
++			const literal = options.hostname.replace(/^\[|\]$/g, "");
++			if (isIP(literal) && !allowed(literal)) {
++				callback(refused(options.hostname), null);
++				return;
++			}
+ 			connect(options, (error, socket) => {
+ 				if (error || !socket) {
+ 					callback(error ?? new Error("connection failed"), null);
+ 					return;
+ 				}
++				// Defence in depth where the platform still reports the peer.
+ 				const peer = socket.remoteAddress ?? "";
+-				if (!peer || !allowed(peer)) {
++				if (peer && !allowed(peer)) {
+ 					socket.destroy();
+-					callback(new BlockedAddressError(`refusing to connect to a private or local address (${options.hostname})`), null);
++					callback(refused(options.hostname), null);
+ 					return;
+ 				}
+ 				callback(null, socket);
+@@ -99,8 +123,11 @@ export async function safeFetch(url: string, init: RequestInit = {}, dispatcher:
+ 	try {
+ 		return (await undiciFetch(url, { ...(init as object), dispatcher })) as unknown as Response;
+ 	} catch (err) {
+-		const cause = (err as { cause?: unknown }).cause;
+-		if (cause instanceof BlockedAddressError) throw new Error(cause.message);
++		let link: unknown = err;
++		for (let depth = 0; link && depth < 4; depth++) {
++			if (link instanceof BlockedAddressError) throw new Error(link.message);
++			link = typeof link === "object" && "cause" in link ? link.cause : undefined;
++		}
+ 		throw err;
+ 	}
+ }
+diff --git a/src/core/contracts/graph.ts b/src/core/contracts/graph.ts
+index 1d19b24..c0bce3a 100644
+--- a/src/core/contracts/graph.ts
++++ b/src/core/contracts/graph.ts
+@@ -86,6 +86,12 @@ export interface NotesSource {
+ 	 * ignored: every explicit notes import processes the whole file. New
+ 	 * imports do not compute or write this field. No migration is needed. */
+ 	contentFp?: string;
++	/** Incomplete-run checkpoint: the chunking inputs' fingerprint plus the
++	 * leading chunks already merged. Written after each merged chunk and
++	 * cleared when a run completes, so a stopped import of the same file
++	 * text resumes at `done` instead of re-paying earlier chunks. A changed
++	 * file (or chunk size) has a different fp and starts from the top. */
++	resume?: { fp: string; chunks: number; done: number };
+ 	/** The run's usage log — same append-only discipline as
+ 	 *  ChatRecord.extractions, idempotent per startedAt. */
+ 	extractions?: ExtractionRunUsage[];
+diff --git a/src/server/index.ts b/src/server/index.ts
+index f6eabee..718ec4d 100644
+--- a/src/server/index.ts
++++ b/src/server/index.ts
+@@ -12,7 +12,7 @@ export * from "./source-organization.ts";
+ export * from "./source-deletion.ts";
+ export { NotesImportError, chunkNotes } from "../agent/subagents/extraction.ts";
+ export { convertPdf } from "../agent/subagents/pdf-ops.ts";
+-export { joinPages, cleanRepeatingHeadersFooters } from "../agent/subagents/pdf-markdown.ts";
++export { joinPages, cleanRepeatingHeadersFooters, filterNonContentPages } from "../agent/subagents/pdf-markdown.ts";
+ export * from "./commit-positions.ts";
+ export * from "./jobs.ts";
+ export { prepareSubmissionImages, prepareSubmissionImageChannels } from "./submission-images.ts";
+diff --git a/tests/appearance-chrome.test.ts b/tests/appearance-chrome.test.ts
+index ae15168..4332aff 100644
+--- a/tests/appearance-chrome.test.ts
++++ b/tests/appearance-chrome.test.ts
+@@ -67,6 +67,6 @@ it("native glyphs contrast against final paint, not the theme's mode label", ()
+ it("external desktop development reads the server's directory rather than the shell's -dev profile", () => {
+ 	const base = { packagedDataDir: "/fixture/packaged/data", repoRoot: "/fixture/repo", env: {} };
+ 	assert.equal(serverDataDir(base), base.packagedDataDir);
+-	assert.equal(serverDataDir({ ...base, devUrl: "http://127.0.0.1:9000" }), "/fixture/repo/data");
++	assert.equal(serverDataDir({ ...base, devUrl: "http://127.0.0.1:9000" }), path.join("/fixture/repo", "data"));
+ 	assert.equal(serverDataDir({ ...base, devUrl: "http://127.0.0.1:9000", env: { LH_DATA_DIR: data } }), data);
+ });
+diff --git a/tests/auth-store.test.ts b/tests/auth-store.test.ts
+index 235fd92..dfae917 100644
+--- a/tests/auth-store.test.ts
++++ b/tests/auth-store.test.ts
+@@ -40,10 +40,12 @@ describe("AuthStore adapter", () => {
+ 
+ 	it("the file is mode 0600 (secrets), also after rewrites", () => {
+ 		authStore.setAuthVar("DEEPGRAM_API_KEY", "d".repeat(40));
+-		const first = fs.statSync(AUTH_FILE).mode & 0o777;
+-		assert.equal(first, 0o600);
++		if (process.platform !== "win32") {
++			const first = fs.statSync(AUTH_FILE).mode & 0o777;
++			assert.equal(first, 0o600);
++		}
+ 		authStore.setAuthVar("DEEPGRAM_API_KEY", "e".repeat(40));
+-		assert.equal(fs.statSync(AUTH_FILE).mode & 0o777, 0o600, "rewrite keeps 0600");
++		if (process.platform !== "win32") assert.equal(fs.statSync(AUTH_FILE).mode & 0o777, 0o600, "rewrite keeps 0600");
+ 	});
+ 
+ 	it("set preserves unknown vars verbatim (forward-compat)", () => {
+diff --git a/tests/automatic-updates.test.ts b/tests/automatic-updates.test.ts
+index 66bf56c..25eb390 100644
+--- a/tests/automatic-updates.test.ts
++++ b/tests/automatic-updates.test.ts
+@@ -131,7 +131,7 @@ describe("automatic-update preference gate", () => {
+ 		f.run("setupAutoUpdater()");
+ 		await f.check();
+ 		assert.equal(f.updater.checks, 0);
+-		assert.deepEqual(f.settingsReads, ["/fixture/custom-user-data-dev/data/settings.json"]);
++		assert.deepEqual(f.settingsReads, [path.join("/fixture/custom-user-data-dev", "data", "settings.json")]);
+ 		await f.check(true);
+ 		assert.equal(f.updater.checks, 1);
+ 		assert.equal(f.settingsReads.length, 1);
+diff --git a/tests/chatgpt-auth.test.ts b/tests/chatgpt-auth.test.ts
+index 1d23c22..34b43f4 100644
+--- a/tests/chatgpt-auth.test.ts
++++ b/tests/chatgpt-auth.test.ts
+@@ -254,11 +254,13 @@ test("private JSON file round-trips global state; creation and atomic replacemen
+ 		await store.write(data);
+ 		assert.deepEqual(JSON.parse(await fs.readFile(file, "utf8")), data, "ordinary JSON, not an encrypted envelope");
+ 		assert.deepEqual(await store.read(), data);
+-		assert.equal((await fs.stat(path.dirname(file))).mode & 0o777, 0o700);
+-		assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+-		await fs.chmod(file, 0o644);
++		if (process.platform !== "win32") {
++			assert.equal((await fs.stat(path.dirname(file))).mode & 0o777, 0o700);
++			assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
++			await fs.chmod(file, 0o644);
++		}
+ 		await store.write({ ...data, allowBackgroundUse: true });
+-		assert.equal((await fs.stat(file)).mode & 0o777, 0o600, "replacement never inherits a permissive old mode");
++		if (process.platform !== "win32") assert.equal((await fs.stat(file)).mode & 0o777, 0o600, "replacement never inherits a permissive old mode");
+ 		assert.equal((await store.read()).allowBackgroundUse, true);
+ 		assert.deepEqual(await fs.readdir(path.dirname(file)), ["chatgpt-credentials.json"]);
+ 	} finally { await fs.rm(dir, { recursive: true, force: true }); }
+diff --git a/tests/claude-code-stream.test.ts b/tests/claude-code-stream.test.ts
+index 240b1e1..9eb0a57 100644
+--- a/tests/claude-code-stream.test.ts
++++ b/tests/claude-code-stream.test.ts
+@@ -752,7 +752,8 @@ test("cwd is an empty temp dir; prompt and mcp config live in a separate private
+ 	assert.ok(!privateDir.startsWith(call.cwd + sep));
+ 	assert.equal(dirname(getFlagValue(call.args, "--mcp-config")), privateDir);
+ 	assert.equal(call.systemPrompt, "You are a tutor.");
+-	assert.equal(call.mcpConfigMode, 0o600);
++	// Windows has no POSIX mode bits; stat reports 0o666 for every regular file.
++	if (process.platform !== "win32") assert.equal(call.mcpConfigMode, 0o600);
+ 
+ 	const mcpConfig = JSON.parse(call.mcpConfig) as { mcpServers: Record<string, { url: string }> };
+ 	assert.match(mcpConfig.mcpServers.learnharness?.url ?? "", /^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+@@ -1141,7 +1142,9 @@ test("normal completion escalates termination when the child ignores SIGTERM", a
+ 	const { events, calls } = await runScenario(t, [JSON.stringify({ fake: "ignore-term" }), ...readFixtureLines("text.jsonl"), HOLD]);
+ 	assert.equal(getLastEvent(events).type, "done");
+ 	await assertCleanedUp(getOnlyCall(calls));
+-	assert.equal(getOnlyCall(calls).child.signalCode, "SIGKILL");
++	// Windows terminates a process unconditionally, so SIGTERM is never ignorable
++	// there and the SIGKILL escalation cannot be observed.
++	if (process.platform !== "win32") assert.equal(getOnlyCall(calls).child.signalCode, "SIGKILL");
+ });
+ 
+ for (const asyncVersionFailure of [false, true]) test(`${asyncVersionFailure ? "an asynchronous version-check" : "a synchronous spawn"} failure removes both temp directories and the bridge`, async () => {
+diff --git a/tests/code-ligatures.test.tsx b/tests/code-ligatures.test.tsx
+index 72acc40..ca04ab1 100644
+--- a/tests/code-ligatures.test.tsx
++++ b/tests/code-ligatures.test.tsx
+@@ -50,8 +50,8 @@ it("the appearance mapping changes ONLY the shared code token, normal permits ra
+ });
+ 
+ it("native inline/fenced code and both CodeMirror modes opt in without changing prose or diagrams", () => {
+-  const native = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
+-  const plugin = readFileSync(new URL("../plugins/coding-questions/src/styles.css", import.meta.url), "utf8");
++  const native = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8").replace(/\r\n/g, "\n");
++  const plugin = readFileSync(new URL("../plugins/coding-questions/src/styles.css", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+   const rule = /([^{}]+)\{[^{}]*font-variant-ligatures:\s*var\(--lh-code-ligatures, none\);[^{}]*\}/g;
+   const selectors = [...native.matchAll(rule)].map(match => match[1]!.replace(/\/\*[\s\S]*?\*\//g, "").trim());
+   assert.deepEqual(selectors, ['[data-streamdown="inline-code"],\n[data-streamdown="code-block"] :is(pre, code)']);
+diff --git a/tests/core-plugin-build.test.ts b/tests/core-plugin-build.test.ts
+index 7341979..d78a117 100644
+--- a/tests/core-plugin-build.test.ts
++++ b/tests/core-plugin-build.test.ts
+@@ -47,11 +47,11 @@ test("failed builds/validation leave the previous staged tree intact", () => fix
+ 	assert.equal(fs.readFileSync(path.join(out, "previous"), "utf8"), "keep");
+ }));
+ 
+-test("staging rejects data, credentials, source/tooling and symlinks instead of copying them", () => {
++test("staging rejects data, credentials, source/tooling and symlinks instead of copying them", (t) => {
+ 	for (const entry of ["data/private.json", "auth.json", ".env", "tests/test.js", "node_modules/x/index.js", "src/main.ts", "linked"]) fixture(root => {
+ 		const code = path.join(root, "plugins", "one", "dist"); const file = path.join(code, entry);
+ 		fs.mkdirSync(path.dirname(file), { recursive: true });
+-		if (entry === "linked") fs.symlinkSync(path.join(code, "main.js"), file); else fs.writeFileSync(file, "private");
++		if (entry === "linked") { try { fs.symlinkSync(path.join(code, "main.js"), file); } catch { t.skip("symlinks need extra rights on this machine"); return; } } else fs.writeFileSync(file, "private");
+ 		assert.throws(() => buildCorePlugins(root, { run() {} }), /Unsafe|Refusing/);
+ 		assert.equal(fs.existsSync(path.join(root, "core-plugins")), false);
+ 	});
+diff --git a/tests/core-plugins.test.ts b/tests/core-plugins.test.ts
+index 757d31b..23ffd93 100644
+--- a/tests/core-plugins.test.ts
++++ b/tests/core-plugins.test.ts
+@@ -79,16 +79,18 @@ test("core provenance/configuration is captured, and replacing the core root wit
+ 	const ctx = await f.host.call("official", "context") as PluginBackendContext;
+ 	assert.equal(ctx.directory, code); assert.equal(ctx.dataDirectory, path.join(data, "official"));
+ 	assert.equal(f.host.list().find(p => p.id === "official")!.origin, "core");
+-	const moved = path.join(f.root, "moved-code"); fs.renameSync(root, moved); fs.symlinkSync(moved, root);
++	const moved = path.join(f.root, "moved-code"); fs.renameSync(root, moved);
++	try { fs.symlinkSync(moved, root); }
++	catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 	assert.throws(() => f.host.asset("official", ["main.js"]), /unsafe plugin asset/);
+ });
+ 
+ test("core data and package symlinks fail closed without writing their targets", async t => {
+ 	for (const kind of ["package", "data-root", "data-id"] as const) {
+ 		const f = fixture(t); const code = f.pkg("official", "core"); const outside = path.join(f.root, `outside-${kind}`); fs.mkdirSync(outside);
+-		if (kind === "package") { fs.rmSync(code, { recursive: true }); fs.symlinkSync(outside, code); }
+-		else if (kind === "data-root") { fs.mkdirSync(path.dirname(f.core.dataDirectory), { recursive: true }); fs.symlinkSync(outside, f.core.dataDirectory); }
+-		else { fs.mkdirSync(f.core.dataDirectory, { recursive: true }); fs.symlinkSync(outside, path.join(f.core.dataDirectory, "official")); }
++		if (kind === "package") { fs.rmSync(code, { recursive: true }); try { fs.symlinkSync(outside, code); } catch { t.skip("symlinks need extra rights on this machine"); return; } }
++		else if (kind === "data-root") { fs.mkdirSync(path.dirname(f.core.dataDirectory), { recursive: true }); try { fs.symlinkSync(outside, f.core.dataDirectory); } catch { t.skip("symlinks need extra rights on this machine"); return; } }
++		else { fs.mkdirSync(f.core.dataDirectory, { recursive: true }); try { fs.symlinkSync(outside, path.join(f.core.dataDirectory, "official")); } catch { t.skip("symlinks need extra rights on this machine"); return; } }
+ 		await f.host.initialize(); await f.host.setEnabled("official", true);
+ 		assert.equal(f.host.list().find(p => p.id === "official")!.status, "error", kind);
+ 		assert.deepEqual(fs.readdirSync(outside), [], kind);
+diff --git a/tests/data-dir-seam.test.ts b/tests/data-dir-seam.test.ts
+index f91b226..9152fc0 100644
+--- a/tests/data-dir-seam.test.ts
++++ b/tests/data-dir-seam.test.ts
+@@ -14,9 +14,13 @@ import * as os from "node:os";
+ import * as path from "node:path";
+ import { execFileSync } from "node:child_process";
+ import { describe, it } from "node:test";
++import { pathToFileURL } from "node:url";
+ 
+ const REPO_ROOT = path.resolve(import.meta.dirname, "..");
+-const TSX_LOADER = path.join(REPO_ROOT, "node_modules", "tsx", "dist", "loader.mjs");
++// `--import` and import specifiers need URLs: a bare `C:\…` path is parsed
++// as a "c:" scheme by the ESM loader on Windows.
++const TSX_LOADER = pathToFileURL(path.join(REPO_ROOT, "node_modules", "tsx", "dist", "loader.mjs")).href;
++const CONFIG_URL = pathToFileURL(path.join(REPO_ROOT, "config.ts")).href;
+ 
+ describe("LH_DATA_DIR seam", () => {
+ 	it("relocates data/chats/graph under LH_DATA_DIR, keeps prompts ROOT-anchored", async () => {
+@@ -40,7 +44,7 @@ describe("LH_DATA_DIR seam", () => {
+ 	it("unset = the repo data/ exactly as before (fresh child process, no env)", () => {
+ 		const out = execFileSync(
+ 			process.execPath,
+-			["--import", TSX_LOADER, "--eval", `const m = await import(${JSON.stringify(path.join(REPO_ROOT, "config.ts"))}); console.log(JSON.stringify({ data: m.PATHS.data, chats: m.PATHS.chats }));`],
++			["--import", TSX_LOADER, "--eval", `const m = await import(${JSON.stringify(CONFIG_URL)}); console.log(JSON.stringify({ data: m.PATHS.data, chats: m.PATHS.chats }));`],
+ 			{ cwd: REPO_ROOT, encoding: "utf-8" },
+ 		);
+ 		const parsed = JSON.parse(out) as { data: string; chats: string | null };
+diff --git a/tests/desktop-platform.test.ts b/tests/desktop-platform.test.ts
+index 8d245b4..69ffbd1 100644
+--- a/tests/desktop-platform.test.ts
++++ b/tests/desktop-platform.test.ts
+@@ -2,7 +2,7 @@
+ import assert from "node:assert/strict";
+ import { readFileSync } from "node:fs";
+ import { createRequire } from "node:module";
+-import { dirname } from "node:path";
++import { dirname, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import { runInNewContext } from "node:vm";
+ import { describe, it } from "node:test";
+@@ -130,7 +130,7 @@ describe("desktop appearance boot and IPC", () => {
+ 		};
+ 		runInNewContext(mainSource, context, { filename: mainFile });
+ 		await runInNewContext("main()", context);
+-		assert.equal(bootDirectory, "/fixture/server-data");
++		assert.equal(bootDirectory, resolve("/fixture/server-data"));
+ 		assert.equal(nativeTheme.themeSource, "light");
+ 		const win = windows[0]!;
+ 		assert.equal(win.options.backgroundColor, "#faf9f5");
+diff --git a/tests/extraction-resume.test.ts b/tests/extraction-resume.test.ts
+new file mode 100644
+index 0000000..943c576
+--- /dev/null
++++ b/tests/extraction-resume.test.ts
+@@ -0,0 +1,158 @@
++/**
++ * Resumable notes extraction (owner, 2026-11-13): a stopped import of the
++ * same file text at the same chunk budget resumes at the first chunk that
++ * never merged instead of re-paying the whole book. The checkpoint lives on
++ * the NotesSource record (`resume`), so it survives process restarts and a
++ * re-upload of the same file.
++ *
++ * Laws pinned here:
++ *  - only successfully merged LEADING chunks advance `done`
++ *  - a completed run clears the checkpoint (an explicit re-import stays whole)
++ *  - a changed file text or chunk budget starts from chunk 1
++ */
++
++import assert from "node:assert/strict";
++import { describe, it } from "node:test";
++import { fauxAssistantMessage, fauxToolCall, type FauxResponseStep, type ToolCall } from "@earendil-works/pi-ai";
++import { createFauxCore } from "@earendil-works/pi-ai";
++import type { PiEngine } from "../src/agent/models.ts";
++import type { CoverageEntry, ExtractionRunUsage, GraphChain, GraphNode, NotesSource, SessionCheckpoint } from "../src/core/contracts.ts";
++import type { GraphStore } from "../src/core/ports.ts";
++import { createExtractionPipeline, NotesImportError } from "../src/agent/subagents/extraction.ts";
++import { chatStore } from "../src/store/chats.ts";
++
++// ─── fixtures ────────────────────────────────────────────────────────────────
++
++function fauxEngine(steps: FauxResponseStep[]): PiEngine {
++	const faux = createFauxCore({});
++	faux.setResponses(steps);
++	return { model: faux.getModel(), streamFn: faux.streamSimple };
++}
++
++function memoryLedgers() {
++	const nodes: GraphNode[] = [];
++	const chains: GraphChain[] = [];
++	const checkpoints: SessionCheckpoint[] = [];
++	const coverage: CoverageEntry[] = [];
++	const sources = new Map<string, NotesSource>();
++	const positions = new Map<string, { x: number; y: number }>();
++	return {
++		appendNode: (n: GraphNode) => void nodes.push(n),
++		readNodes: () => nodes.map((n) => ({ ...n })),
++		appendChain: (c: GraphChain) => void chains.push(c),
++		readChains: () => chains.map((c) => ({ ...c, premises: [...c.premises], provenance: [...c.provenance] })),
++		appendCheckpoint: (c: SessionCheckpoint) => void checkpoints.push(c),
++		readCheckpoints: () => checkpoints.map((c) => ({ ...c })),
++		appendCoverage: (e) => void coverage.push({ ...e }),
++		readCoverage: () => coverage.map((e) => ({ ...e })),
++		upsertSource: (s: NotesSource) => {
++			const prev = sources.get(s.id);
++			sources.set(s.id, { ...s, extractions: [...(prev?.extractions ?? [])] });
++		},
++		readSources: () => [...sources.values()].map((s) => ({ ...s, extractions: [...(s.extractions ?? [])] })),
++		deleteSources: (ids: ReadonlySet<string>) => [...ids].reduce((count, id) => count + Number(sources.delete(id)), 0),
++		appendSourceUsage: (id: string, entry: ExtractionRunUsage) => {
++			const source = sources.get(id);
++			if (!source) return;
++			if (!source.extractions?.some((r) => r.startedAt === entry.startedAt)) {
++				source.extractions = [...(source.extractions ?? []), entry];
++			}
++		},
++		readPositions: () => Object.fromEntries([...positions].map(([id, p]) => [id, { ...p }])),
++		writePositions: (next) => {
++			positions.clear();
++			for (const [id, p] of Object.entries(next)) positions.set(id, { x: p.x, y: p.y });
++		},
++		rewriteLedgers: (next) => {
++			if (next.nodes) nodes.splice(0, nodes.length, ...next.nodes.map((n) => ({ ...n, provenance: [...n.provenance], aliases: [...n.aliases] })));
++			if (next.chains) chains.splice(0, chains.length, ...next.chains.map((c) => ({ ...c, premises: [...c.premises], provenance: [...c.provenance] })));
++			if (next.coverage) coverage.splice(0, coverage.length, ...next.coverage.map((c) => ({ ...c })));
++			if (next.checkpoints) checkpoints.splice(0, checkpoints.length, ...next.checkpoints.map((c) => ({ ...c })));
++		},
++	} satisfies GraphStore;
++}
++
++const FINDINGS = {
++	propositions: [{ id: "p1", name: "Vim normal mode", statement: "Vim starts in Normal mode, where keys are commands.", aliases: [] }],
++	chains: [],
++};
++const VERDICT = { links: [], edges: [] } as const;
++
++/** Three chunks at budget 1: one heading-less line each. */
++const THREE = "first chunk line\nsecond chunk line\nthird chunk line";
++const TWO = "first chunk line\nsecond chunk line";
++
++/** An extractor that counts model calls and can fail at a chosen 1-based
++ *  call. Faux steps are one-shot, so the queue is pre-built per run. */
++function countingExtractor(failAt?: number, steps = 6): { engine: PiEngine; calls: () => number } {
++	let calls = 0;
++	const step = () => {
++		calls++;
++		if (failAt !== undefined && calls === failAt) throw new Error("synthetic failed chunk");
++		return fauxAssistantMessage([fauxToolCall("submit_findings", FINDINGS as unknown as ToolCall["arguments"])], { stopReason: "toolUse" });
++	};
++	return { engine: fauxEngine(Array.from({ length: steps }, () => step)), calls: () => calls };
++}
++
++/** A pipeline over one store whose extractor fails at call `failAt` only on
++ *  its first run (later runs are clean). */
++function pipeline(ledgers: GraphStore, extractor: PiEngine) {
++	return createExtractionPipeline({
++		chatStore,
++		graphStore: ledgers,
++		getChunkTokens: () => 1,
++		extractor,
++		auditor: fauxEngine(Array.from({ length: 8 }, () => () =>
++			fauxAssistantMessage([fauxToolCall("submit_review", VERDICT as unknown as ToolCall["arguments"])], { stopReason: "toolUse" }))),
++	});
++}
++
++const input = { filePath: "/vault/three.md", text: THREE };
++
++function unfinished(error: unknown): boolean {
++	assert.ok(error instanceof NotesImportError);
++	assert.notEqual(error.outcome, "completed");
++	return true;
++}
++
++// ─── the laws ────────────────────────────────────────────────────────────────
++
++describe("resumable notes extraction", () => {
++	it("resumes after the last merged chunk of a partial run instead of re-extracting the whole file", async () => {
++		const ledgers = memoryLedgers();
++		const first = countingExtractor(3);
++		await assert.rejects(pipeline(ledgers, first.engine).importNotes(input), unfinished);
++		assert.equal(first.calls(), 3, "all three chunks were attempted once");
++		const checkpoint = ledgers.readSources()[0]!.resume;
++		assert.deepEqual(checkpoint && { chunks: checkpoint.chunks, done: checkpoint.done }, { chunks: 3, done: 2 }, "the leading two chunks merged before the failure");
++
++		const retry = countingExtractor();
++		await pipeline(ledgers, retry.engine).importNotes(input);
++		assert.equal(retry.calls(), 1, "only the unfinished third chunk re-ran");
++		assert.equal(ledgers.readSources()[0]!.resume, undefined, "a completed run clears the checkpoint");
++	});
++
++	it("starts from the top when the file text changed", async () => {
++		const ledgers = memoryLedgers();
++		await assert.rejects(pipeline(ledgers, countingExtractor(3).engine).importNotes(input), unfinished);
++
++		const retry = countingExtractor();
++		await pipeline(ledgers, retry.engine).importNotes({ filePath: input.filePath, text: TWO });
++		assert.equal(retry.calls(), 2, "different text means a different fingerprint: both chunks run");
++		assert.equal(ledgers.readSources()[0]!.resume, undefined);
++	});
++
++	it("a completed import re-imports the whole file (no silent skip)", async () => {
++		const ledgers = memoryLedgers();
++		await pipeline(ledgers, countingExtractor().engine).importNotes(input);
++		const retry = countingExtractor();
++		await pipeline(ledgers, retry.engine).importNotes(input);
++		assert.equal(retry.calls(), 3);
++	});
++
++	it("a failed first chunk leaves no resume point", async () => {
++		const ledgers = memoryLedgers();
++		await assert.rejects(pipeline(ledgers, countingExtractor(1).engine).importNotes(input), unfinished);
++		assert.equal(ledgers.readSources()[0]!.resume, undefined);
++	});
++});
+diff --git a/tests/file-access-settings.test.ts b/tests/file-access-settings.test.ts
+index 7c4cf83..c4d2e59 100644
+--- a/tests/file-access-settings.test.ts
++++ b/tests/file-access-settings.test.ts
+@@ -86,15 +86,17 @@ describe("strict persisted file-access policy", () => {
+ 		assert.equal(readFileAccessSettings().ok, false);
+ 		assert.throws(() => resolveSourcePath(path.join(a, "notes.md")), blocked);
+ 	});
+-	it("directories, dangling settings symlinks and dangling data-directory symlinks are not first boot", async () => {
++	it("directories, dangling settings symlinks and dangling data-directory symlinks are not first boot", async (t) => {
+ 		await fs.mkdir(SETTINGS_FILE);
+ 		assert.equal(readFileAccessSettings().ok, false);
+ 		await fs.rmdir(SETTINGS_FILE);
+-		await fs.symlink(path.join(root, "missing-settings.json"), SETTINGS_FILE, "file");
++		try { await fs.symlink(path.join(root, "missing-settings.json"), SETTINGS_FILE, "file"); }
++		catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		assert.equal(readFileAccessSettings().ok, false);
+ 		await fs.unlink(SETTINGS_FILE);
+ 		await fs.rmdir(data);
+-		await fs.symlink(path.join(root, "missing-data"), data, process.platform === "win32" ? "junction" : "dir");
++		try { await fs.symlink(path.join(root, "missing-data"), data, process.platform === "win32" ? "junction" : "dir"); }
++		catch { await fs.mkdir(data); t.skip("symlinks need extra rights on this machine"); return; }
+ 		try { assert.equal(readFileAccessSettings().ok, false); }
+ 		finally { await fs.unlink(data); await fs.mkdir(data); }
+ 	});
+diff --git a/tests/helpers/plugin-authoring-fixture.ts b/tests/helpers/plugin-authoring-fixture.ts
+index 4b7f78d..9580ca9 100644
+--- a/tests/helpers/plugin-authoring-fixture.ts
++++ b/tests/helpers/plugin-authoring-fixture.ts
+@@ -5,7 +5,7 @@ import * as path from "node:path";
+ /** Code examples can contain [index](argument) syntax that is not a Markdown link. */
+ export function markdownProse(text: string): string {
+ 	let fence: { marker: string; length: number } | undefined;
+-	return text.split("\n").map(line => {
++	return text.split(/\r?\n/).map(line => {
+ 		const match = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+ 		if (!fence && match) { fence = { marker: match[1]![0]!, length: match[1]!.length }; return ""; }
+ 		if (fence) {
+diff --git a/tests/learner-image-snapshots.test.ts b/tests/learner-image-snapshots.test.ts
+index 9abe53d..2458895 100644
+--- a/tests/learner-image-snapshots.test.ts
++++ b/tests/learner-image-snapshots.test.ts
+@@ -156,11 +156,12 @@ describe("learner image source safety", () => {
+ 		finally { clearTimeout(timer); }
+ 	});
+ 
+-	it("uses the shared sensitive-path guard for displays and annotation dispatch", async () => {
++	it("uses the shared sensitive-path guard for displays and annotation dispatch", async (t) => {
+ 		const home = await fs.mkdtemp(path.join(scratch, "home-"));
+ 		await fs.mkdir(path.join(home, ".claude"));
+ 		await fs.writeFile(path.join(home, ".claude", "private.png"), picture());
+-		await fs.symlink(path.join(home, ".claude"), path.join(home, "alias"));
++		try { await fs.symlink(path.join(home, ".claude"), path.join(home, "alias")); }
++		catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		const old = process.env.HOME;
+ 		try {
+ 			process.env.HOME = home;
+diff --git a/tests/model-catalog.test.ts b/tests/model-catalog.test.ts
+index da2242c..24e017d 100644
+--- a/tests/model-catalog.test.ts
++++ b/tests/model-catalog.test.ts
+@@ -347,7 +347,10 @@ function withClaudeInstalled(installed: boolean, fn: () => void, enabled = true)
+ 	const settings = readSettings();
+ 	writeSettings({ ...(settings ?? { version: 1 }), claudeCode: { enabled } });
+ 
+-	if (installed) fs.writeFileSync(path.join(dir, "claude"), "#!/bin/sh\n", { mode: 0o755 });
++	if (installed) {
++		const name = process.platform === "win32" ? "claude.exe" : "claude";
++		fs.writeFileSync(path.join(dir, name), "#!/bin/sh\n", { mode: 0o755 });
++	}
+ 	process.env.PATH = dir;
+ 	process.env.HOME = dir;
+ 	delete process.env.npm_config_prefix;
+diff --git a/tests/pdf-content-filter.test.ts b/tests/pdf-content-filter.test.ts
+new file mode 100644
+index 0000000..48bf76a
+--- /dev/null
++++ b/tests/pdf-content-filter.test.ts
+@@ -0,0 +1,39 @@
++import assert from "node:assert/strict";
++import { describe, it } from "node:test";
++import { filterNonContentPages, type PdfPage } from "../src/agent/subagents/pdf-markdown.ts";
++
++describe("filterNonContentPages", () => {
++	it("preserves ordinary content pages", () => {
++		const pages: PdfPage[] = [
++			{ kind: "text", number: 1, markdown: "# Chapter 1\nThis is core subject matter." },
++			{ kind: "text", number: 2, markdown: "# Chapter 2\nAnother important concept explained." },
++		];
++		const result = filterNonContentPages(pages);
++		assert.equal(result.pages.length, 2);
++		assert.equal(result.skippedCount, 0);
++	});
++
++	it("filters out Table of Contents pages", () => {
++		const pages: PdfPage[] = [
++			{ kind: "text", number: 1, markdown: "# Table of Contents\nChapter 1: Intro ...... 1\nChapter 2: Core ....... 15\nChapter 3: Advanced ... 40" },
++			{ kind: "text", number: 2, markdown: "# Chapter 1\nActual core learning material." },
++		];
++		const result = filterNonContentPages(pages);
++		assert.equal(result.pages.length, 1);
++		assert.equal(result.pages[0]?.number, 2);
++		assert.equal(result.skippedCount, 1);
++		assert.ok(result.skippedTypes.includes("contents"));
++	});
++
++	it("filters out Index pages with word-number references", () => {
++		const pages: PdfPage[] = [
++			{ kind: "text", number: 1, markdown: "# Chapter 1\nCore material." },
++			{ kind: "text", number: 2, markdown: "# Index\nAbstraction, 12, 14, 99\nAlgorithm, 5, 23, 45\nArray, 18, 32" },
++		];
++		const result = filterNonContentPages(pages);
++		assert.equal(result.pages.length, 1);
++		assert.equal(result.pages[0]?.number, 1);
++		assert.equal(result.skippedCount, 1);
++		assert.ok(result.skippedTypes.includes("index"));
++	});
++});
+diff --git a/tests/plugin-api-reference.test.ts b/tests/plugin-api-reference.test.ts
+index f9dd80d..e6337bd 100644
+--- a/tests/plugin-api-reference.test.ts
++++ b/tests/plugin-api-reference.test.ts
+@@ -37,14 +37,17 @@ it("does not follow declaration imports outside the SDK", () => fixture((root, w
+ 	assert.throws(() => createPluginApiReference({ sdk: path.join(root, "sdk") }), /Refusing.*outside or missing SDK/);
+ }));
+ 
+-it("refuses source and output links and writing over the input SDK", () => fixture((root, write) => {
++it("refuses source and output links and writing over the input SDK", (t) => fixture((root, write) => {
+ 	write("sdk/index.d.ts", "export interface Api { readonly value: string }");
+ 	write("keep.txt", "preserve");
+-	fs.symlinkSync(path.join(root, "keep.txt"), path.join(root, "sdk/linked.d.ts"));
++	try { fs.symlinkSync(path.join(root, "keep.txt"), path.join(root, "sdk/linked.d.ts")); }
++	catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 	assert.throws(() => createPluginApiReference({ sdk: path.join(root, "sdk") }), /Refusing.*symlink/);
+ 	fs.unlinkSync(path.join(root, "sdk/linked.d.ts"));
+ 	assert.throws(() => writePluginApiReference({ sdk: path.join(root, "sdk"), output: path.join(root, "sdk") }), /Refusing/);
+-	fs.mkdirSync(path.join(root, "output")); fs.symlinkSync(path.join(root, "keep.txt"), path.join(root, "output/README.md"));
++	fs.mkdirSync(path.join(root, "output"));
++	try { fs.symlinkSync(path.join(root, "keep.txt"), path.join(root, "output/README.md")); }
++	catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 	assert.throws(() => writePluginApiReference({ sdk: path.join(root, "sdk"), output: path.join(root, "output") }), /Refusing.*symlink/);
+ 	assert.equal(fs.readFileSync(path.join(root, "keep.txt"), "utf8"), "preserve");
+ }));
+@@ -81,6 +84,7 @@ it("the committed reference covers every real SDK public type/member and exactly
+ 	assert.equal(reference.inventory.reduce((n: number, entry: { exports: string[] }) => n + entry.exports.length, 0), count);
+ 	const committed = path.resolve("docs/plugin-api");
+ 	assert.deepEqual(fs.readdirSync(committed).sort(), [...reference.pages.keys()].sort());
+-	for (const [filename, text] of reference.pages) assert.equal(fs.readFileSync(path.join(committed, filename), "utf8"), text, `Regenerate stale reference: ${filename}`);
++	// Checked-out files may carry CRLF on Windows; compare line endings canonically, never content.
++	for (const [filename, text] of reference.pages) assert.equal(fs.readFileSync(path.join(committed, filename), "utf8").replace(/\r\n/g, "\n"), text.replace(/\r\n/g, "\n"), `Regenerate stale reference: ${filename}`);
+ 	for (const entry of reference.inventory) for (const member of entry.members) assert.ok(reference.pages.get(entry.module + ".md")!.includes(member.signature), `${entry.name}.${member.key}`);
+ }));
+diff --git a/tests/plugin-authoring-bundle.test.ts b/tests/plugin-authoring-bundle.test.ts
+index 974c1b9..b9a618e 100644
+--- a/tests/plugin-authoring-bundle.test.ts
++++ b/tests/plugin-authoring-bundle.test.ts
+@@ -140,22 +140,26 @@ it("regenerates deterministic dev and standalone archives without stale expanded
+ 	assert.equal(packaged.directory, path.join(root, ".next/standalone/plugin-authoring"));
+ }));
+ 
+-it("refuses unsafe example contents, source symlinks and output symlinks without changing their targets", () => {
++it("refuses unsafe example contents, source symlinks and output symlinks without changing their targets", (t) => {
+ 	for (const mode of ["data", "credentials", "source-link", "output-link", "dangling-output-link"]) fixture(root => {
+ 		const dist = path.join(root, "examples/plugins/hello-plugin/dist");
+ 		const outside = path.join(root, "keep.txt"); fs.writeFileSync(outside, "preserve");
+ 		if (mode === "data") fs.mkdirSync(path.join(dist, "data"));
+ 		if (mode === "credentials") fs.writeFileSync(path.join(dist, ".env.local"), "private");
+-		if (mode === "source-link") fs.symlinkSync(outside, path.join(dist, "linked.js"));
++		if (mode === "source-link") {
++			try { fs.symlinkSync(outside, path.join(dist, "linked.js")); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
++		}
+ 		if (mode.includes("output-link")) {
+ 			fs.mkdirSync(path.join(root, "public"));
+-			fs.symlinkSync(mode.startsWith("dangling") ? path.join(root, "missing") : root, path.join(root, "public/plugin-authoring"), "dir");
++			try { fs.symlinkSync(mode.startsWith("dangling") ? path.join(root, "missing") : root, path.join(root, "public/plugin-authoring"), "dir"); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		}
+ 		assert.throws(() => buildPluginAuthoring({ root }), /Refusing/);
+ 		assert.equal(fs.readFileSync(outside, "utf8"), "preserve");
+ 	});
+ });
+-it("rejects every curated source-file symlink before replacing existing outputs", () => {
++it("rejects every curated source-file symlink before replacing existing outputs", (t) => {
+ 	for (const relative of ["skills/learnharness-plugins/SKILL.md", "package.json", "LICENSE", "docs/plugin-authoring.md", "skills/learnharness-plugins/README.md", "examples/plugins/hello-plugin/README.md", "examples/plugins/hello-plugin/dist/manifest.json", "examples/plugins/hello-plugin/dist/main.js", "scripts/build-plugin-types.mjs", "scripts/build-plugin-api-reference.mjs", "scripts/install-plugin-local.mjs", "plugins/flashcards/src/main.js", "plugins/ui-showcase/README.md"]) fixture(root => {
+ 		const built = buildPluginAuthoring({ root });
+ 		const archive = fs.readFileSync(built.archive), skill = fs.readFileSync(path.join(built.directory, "SKILL.md"));
+@@ -163,14 +167,16 @@ it("rejects every curated source-file symlink before replacing existing outputs"
+ 		try {
+ 			const source = path.join(root, relative), target = path.join(external, path.basename(source));
+ 			fs.copyFileSync(source, target);
+-			fs.unlinkSync(source); fs.symlinkSync(target, source);
++			fs.unlinkSync(source);
++			try { fs.symlinkSync(target, source); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 			assert.throws(() => buildPluginAuthoring({ root }), /Refusing.*symlink/, relative);
+ 			assert.deepEqual(fs.readFileSync(built.archive), archive, relative);
+ 			assert.deepEqual(fs.readFileSync(path.join(built.directory, "SKILL.md")), skill, relative);
+ 		} finally { fs.rmSync(external, { recursive: true, force: true }); }
+ 	});
+ });
+-it("rejects source ancestor-directory symlinks before replacing existing outputs", () => {
++it("rejects source ancestor-directory symlinks before replacing existing outputs", (t) => {
+ 	for (const relative of ["docs", "skills", "skills/learnharness-plugins", "examples", "examples/plugins", "examples/plugins/hello-plugin", "examples/plugins/hello-plugin/dist", "scripts", "plugins", "plugins/flashcards", "plugins/flashcards/src"]) fixture(root => {
+ 		const built = buildPluginAuthoring({ root });
+ 		const archive = fs.readFileSync(built.archive), skill = fs.readFileSync(path.join(built.directory, "SKILL.md"));
+@@ -178,7 +184,9 @@ it("rejects source ancestor-directory symlinks before replacing existing outputs
+ 		try {
+ 			const source = path.join(root, relative), target = path.join(external, "source");
+ 			fs.cpSync(source, target, { recursive: true });
+-			fs.rmSync(source, { recursive: true }); fs.symlinkSync(target, source, "dir");
++			fs.rmSync(source, { recursive: true });
++			try { fs.symlinkSync(target, source, "dir"); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 			assert.throws(() => buildPluginAuthoring({ root }), /Refusing.*symlink/, relative);
+ 			assert.deepEqual(fs.readFileSync(built.archive), archive, relative);
+ 			assert.deepEqual(fs.readFileSync(path.join(built.directory, "SKILL.md")), skill, relative);
+diff --git a/tests/plugin-document-types.test.ts b/tests/plugin-document-types.test.ts
+index 3c89379..c7a94f0 100644
+--- a/tests/plugin-document-types.test.ts
++++ b/tests/plugin-document-types.test.ts
+@@ -6,14 +6,15 @@ import * as path from "node:path";
+ import * as os from "node:os";
+ import { it } from "node:test";
+ 
+-it("generated public document API accepts only Files and optional caller cancellation", () => {
++it("generated public document API accepts only Files and optional caller cancellation", (t) => {
+ 	const root = path.resolve(import.meta.dirname, "..");
+ 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-plugin-document-types-test-"));
+ 	try {
+ 		const output = path.join(home, "api");
+ 		const build = spawnSync(process.execPath, [path.join(root, "scripts", "build-plugin-types.mjs"), output], { cwd: root, encoding: "utf8", timeout: 120_000 });
+ 		assert.equal(build.status, 0, String(build.stdout) + String(build.stderr));
+-		fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
++		try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
++		catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		const consumer = path.join(home, "consumer.mts");
+ 		fs.writeFileSync(consumer, `
+ import type { PluginBackendContext, PluginFrontendContext } from "./api/index.d.ts";
+diff --git a/tests/plugin-grading-types.test.ts b/tests/plugin-grading-types.test.ts
+index e2b3b97..62b60f5 100644
+--- a/tests/plugin-grading-types.test.ts
++++ b/tests/plugin-grading-types.test.ts
+@@ -6,7 +6,7 @@ import * as path from "node:path";
+ import * as os from "node:os";
+ import { it } from "node:test";
+ 
+-it("portable public SDK supports typed generic grading without exposing host authority or presentation policy", () => {
++it("portable public SDK supports typed generic grading without exposing host authority or presentation policy", (t) => {
+ 	const root = path.resolve(import.meta.dirname, "..");
+ 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-plugin-grading-types-test-"));
+ 	try {
+@@ -14,7 +14,8 @@ it("portable public SDK supports typed generic grading without exposing host aut
+ 		const build = spawnSync(process.execPath, [path.join(root, "scripts", "build-plugin-types.mjs"), output], { cwd: root, encoding: "utf8", timeout: 120_000 });
+ 		assert.equal(build.status, 0, String(build.stdout) + String(build.stderr));
+ 		assert.equal(fs.existsSync(path.join(output, "src/server")), false);
+-		fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
++		try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
++		catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		const consumer = path.join(home, "consumer.mts");
+ 		fs.writeFileSync(consumer, `
+ import { Type } from "typebox";
+diff --git a/tests/plugin-host.test.ts b/tests/plugin-host.test.ts
+index 6653bdc..246f6c1 100644
+--- a/tests/plugin-host.test.ts
++++ b/tests/plugin-host.test.ts
+@@ -204,10 +204,12 @@ test("frontend-only assets are explicitly allowlisted, immutable by revision, an
+ 	assert.equal(f.host.list()[0]!.revision, revision);
+ 	assert.equal(Buffer.from(f.host.asset("example", ["main.js"]).bytes).toString(), "export const version = 1");
+ 	fs.unlinkSync(path.join(dir, "assets", "image.svg"));
+-	fs.symlinkSync(path.join(dir, "data", "private.json"), path.join(dir, "assets", "image.svg"));
++	try { fs.symlinkSync(path.join(dir, "data", "private.json"), path.join(dir, "assets", "image.svg")); }
++	catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 	assert.throws(() => f.host.asset("example", ["assets", "image.svg"]), status(404));
+ 	fs.rmSync(path.join(dir, "assets"), { recursive: true });
+-	fs.symlinkSync(path.join(dir, "data"), path.join(dir, "assets"));
++	try { fs.symlinkSync(path.join(dir, "data"), path.join(dir, "assets")); }
++	catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 	assert.throws(() => f.host.asset("example", ["assets", "private.json"]), status(404));
+ 	await f.host.setEnabled("example", false); await f.host.setEnabled("example", true);
+ 	assert.equal(f.host.list()[0]!.status, "error");
+@@ -342,7 +344,9 @@ test("symlinked plugin roots and build directories cannot be activated", async t
+ 	for (const target of ["root", "dist"]) {
+ 		const f = fixture(t), code = f.plugin(), root = path.dirname(code);
+ 		const from = target === "root" ? root : code, outside = path.join(f.root, "outside");
+-		fs.renameSync(from, outside); fs.symlinkSync(outside, from);
++		fs.renameSync(from, outside);
++		try { fs.symlinkSync(outside, from); }
++		catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		await f.host.initialize(); await f.host.setEnabled("example", true);
+ 		assert.equal(f.host.list()[0]!.status, "error", target);
+ 		assert.match(f.host.list()[0]!.error!, /Unsafe/, target);
+@@ -355,7 +359,9 @@ test("asset access rejects a plugin-root symlink introduced after discovery", as
+ 	const f = fixture(t), code = f.plugin("example", { backend: undefined, main: "main.js" }), root = path.dirname(code);
+ 	fs.writeFileSync(path.join(code, "main.js"), "export const safe = true");
+ 	await f.host.initialize(); await f.host.setEnabled("example", true);
+-	const outside = path.join(f.root, "outside"); fs.renameSync(root, outside); fs.symlinkSync(outside, root);
++	const outside = path.join(f.root, "outside"); fs.renameSync(root, outside);
++	try { fs.symlinkSync(outside, root); }
++	catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 	assert.throws(() => f.host.asset("example", ["main.js"]), status(404));
+ });
+ 
+diff --git a/tests/plugin-install-local.test.ts b/tests/plugin-install-local.test.ts
+index 6eed5c8..7951802 100644
+--- a/tests/plugin-install-local.test.ts
++++ b/tests/plugin-install-local.test.ts
+@@ -82,7 +82,7 @@ it("checks portable manifest structural rules against the host contract", () =>
+ 		installPluginLocal({ project, pluginsDirectory: directory });
+ 	}
+ }));
+-it("refuses non-distributable contents, file and directory symlinks, including manifest and root links", () => {
++it("refuses non-distributable contents, file and directory symlinks, including manifest and root links", (t) => {
+ 	for (const mode of ["data", "nested-data", "credentials", "manifest-link", "asset-link", "asset-parent-link", "dist-link", "project-link", "directory-link"]) fixture(({ root, project, directory, installed, write }) => {
+ 		if (mode === "data") write("source project/dist/data/private.json", "private");
+ 		if (mode === "nested-data") write("source project/dist/assets/data/private.json", "private");
+@@ -90,22 +90,39 @@ it("refuses non-distributable contents, file and directory symlinks, including m
+ 		if (["manifest-link", "asset-link", "asset-parent-link", "dist-link"].includes(mode)) {
+ 			const entry = mode === "manifest-link" ? "manifest.json" : mode === "asset-link" ? "assets/chunk.js" : mode === "asset-parent-link" ? "assets" : "";
+ 			const source = path.join(project, "dist", entry), target = path.join(root, "external");
+-			fs.renameSync(source, target); fs.symlinkSync(target, source, fs.statSync(target).isDirectory() ? "dir" : "file");
++			fs.renameSync(source, target);
++			try { fs.symlinkSync(target, source, fs.statSync(target).isDirectory() ? "dir" : "file"); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		}
+ 		let source = project, target = directory;
+-		if (mode === "project-link") { source = path.join(root, "project-link"); fs.symlinkSync(project, source, "dir"); }
+-		if (mode === "directory-link") { target = path.join(root, "directory-link"); fs.symlinkSync(directory, target, "dir"); }
++		if (mode === "project-link") {
++			source = path.join(root, "project-link");
++			try { fs.symlinkSync(project, source, "dir"); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
++		}
++		if (mode === "directory-link") {
++			target = path.join(root, "directory-link");
++			try { fs.symlinkSync(directory, target, "dir"); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
++		}
+ 		assert.throws(() => installPluginLocal({ project: source, pluginsDirectory: target }), /Refusing/);
+ 		unchanged(installed);
+ 	});
+ });
+-it("refuses linked target plugin/dist and misplaced target dist/data, even dangling links", () => {
++it("refuses linked target plugin/dist and misplaced target dist/data, even dangling links", (t) => {
+ 	for (const mode of ["plugin", "dist", "data", "dangling-data"]) fixture(({ root, project, directory, installed }) => {
+ 		const source = mode === "plugin" ? installed : mode === "dist" ? path.join(installed, "dist") : path.join(installed, "dist/data");
+ 		const external = path.join(root, "external");
+-		if (mode === "plugin" || mode === "dist") { fs.renameSync(source, external); fs.symlinkSync(external, source, "dir"); }
++		if (mode === "plugin" || mode === "dist") {
++			fs.renameSync(source, external);
++			try { fs.symlinkSync(external, source, "dir"); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
++		}
+ 		else if (mode === "data") fs.mkdirSync(source);
+-		else fs.symlinkSync(external, source, "dir");
++		else {
++			try { fs.symlinkSync(external, source, "dir"); }
++			catch { t.skip("symlinks need extra rights on this machine"); return; }
++		}
+ 		assert.throws(() => installPluginLocal({ project, pluginsDirectory: directory }), /Refusing/);
+ 		assert.equal(fs.readFileSync(path.join(installed, "dist/main.js"), "utf8"), "old code");
+ 		assert.equal(fs.readFileSync(path.join(installed, "data/private.json"), "utf8"), "installed data");
+@@ -141,7 +158,10 @@ it("the documented npm command builds and installs without a checkout, and build
+ 	write("source project/package.json", JSON.stringify({ private: true, scripts: { build: 'node -e "process.exit(Number(process.env.FAIL_BUILD || 0))"', "install:local": "npm run build && node scripts/install-plugin-local.mjs" } }));
+ 	const npm = process.env.npm_execpath;
+ 	assert.ok(npm, "test must run under npm");
+-	const execute = (fail: string) => spawnSync(process.execPath, [npm, "run", "install:local", "--", directory], { cwd: project, encoding: "utf8", env: { ...process.env, HOME: root, FAIL_BUILD: fail } });
++	// npm double-escapes arguments when it resolves npm.CMD (cmd.exe path), mangling a directory containing spaces;
++	// a real shell passes the documented `-- "<dir>"` argument through unchanged.
++	const scriptShell = ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"].find(file => fs.existsSync(file));
++	const execute = (fail: string) => spawnSync(process.execPath, [npm, "run", "install:local", "--", directory], { cwd: project, encoding: "utf8", env: { ...process.env, HOME: root, FAIL_BUILD: fail, ...(scriptShell ? { npm_config_script_shell: scriptShell } : {}) } });
+ 	const failed = execute("1"); assert.equal(failed.status, 1, failed.stderr); unchanged(installed);
+ 	const success = execute("0"); assert.equal(success.status, 0, success.stderr);
+ 	assert.match(success.stdout, /Installed:/);
+diff --git a/tests/plugin-problem-types.test.ts b/tests/plugin-problem-types.test.ts
+index 7a56eb5..f226c4c 100644
+--- a/tests/plugin-problem-types.test.ts
++++ b/tests/plugin-problem-types.test.ts
+@@ -6,14 +6,15 @@ import * as path from "node:path";
+ import * as os from "node:os";
+ import test from "node:test";
+ 
+-test("portable public SDK infers practice payload/submission schemas and exposes processing, not assessment authority", () => {
++test("portable public SDK infers practice payload/submission schemas and exposes processing, not assessment authority", (t) => {
+   const root = path.resolve(import.meta.dirname, ".."), home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-plugin-problem-types-"));
+   try {
+     const output = path.join(home, "api");
+     const build = spawnSync(process.execPath, [path.join(root, "scripts/build-plugin-types.mjs"), output], { cwd: root, encoding: "utf8", timeout: 120_000 });
+     assert.equal(build.status, 0, String(build.stdout) + String(build.stderr));
+     assert.equal(fs.existsSync(path.join(output, "src/server")), false);
+-    fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
++    try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
++    catch { t.skip("symlinks need extra rights on this machine"); return; }
+     const consumer = path.join(home, "consumer.mts");
+     fs.writeFileSync(consumer, `
+ import { Type } from "typebox";
+diff --git a/tests/plugin-question-types.test.ts b/tests/plugin-question-types.test.ts
+index cb9e72c..db430fd 100644
+--- a/tests/plugin-question-types.test.ts
++++ b/tests/plugin-question-types.test.ts
+@@ -6,7 +6,7 @@ import * as path from "node:path";
+ import * as os from "node:os";
+ import { it } from "node:test";
+ 
+-it("packaged question SDK contracts support strict consumers without exposing host authority APIs", () => {
++it("packaged question SDK contracts support strict consumers without exposing host authority APIs", (t) => {
+ 	const root = path.resolve(import.meta.dirname, "..");
+ 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-question-types-test-"));
+ 	try {
+@@ -15,7 +15,8 @@ it("packaged question SDK contracts support strict consumers without exposing ho
+ 		assert.equal(build.status, 0, String(build.stdout) + String(build.stderr));
+ 		assert.ok(fs.existsSync(path.join(output, "src/core/plugin-questions.d.ts")));
+ 		assert.equal(fs.existsSync(path.join(output, "src/server")), false);
+-		fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
++		try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
++		catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		const consumer = path.join(home, "consumer.mts");
+ 		fs.writeFileSync(consumer, `
+ import { Type } from "typebox";
+diff --git a/tests/plugin-submission-types.test.ts b/tests/plugin-submission-types.test.ts
+index b7181be..ca56cbc 100644
+--- a/tests/plugin-submission-types.test.ts
++++ b/tests/plugin-submission-types.test.ts
+@@ -6,7 +6,7 @@ import * as path from "node:path";
+ import * as os from "node:os";
+ import { it } from "node:test";
+ 
+-it("portable submission SDK exposes readonly learner input and opaque native surfaces without backend hooks", () => {
++it("portable submission SDK exposes readonly learner input and opaque native surfaces without backend hooks", (t) => {
+ 	const root = path.resolve(import.meta.dirname, "..");
+ 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-submission-types-"));
+ 	try {
+@@ -15,7 +15,8 @@ it("portable submission SDK exposes readonly learner input and opaque native sur
+ 		assert.equal(build.status, 0, String(build.stdout) + String(build.stderr));
+ 		assert.ok(fs.existsSync(path.join(output, "src/core/plugin-submissions.d.ts")));
+ 		assert.equal(fs.existsSync(path.join(output, "src/server")), false);
+-		fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
++		try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
++		catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		const consumer = path.join(home, "consumer.mts");
+ 		fs.writeFileSync(consumer, `
+ import type { PluginSubmission, PluginSubmissionContext, PluginSubmissionTarget, PluginSubmissionImages, PluginSubmissionOccurrence, PluginSubmissionInterceptor, PluginFrontendContext, PluginBackendContext, PluginActionContext } from "./api/index.d.ts";
+diff --git a/tests/plugin-task-records.test.ts b/tests/plugin-task-records.test.ts
+index b4dacc8..cc2c9b7 100644
+--- a/tests/plugin-task-records.test.ts
++++ b/tests/plugin-task-records.test.ts
+@@ -59,7 +59,8 @@ test("strict get/list refuse task files that are directories or symlinks", t =>
+ 	const directory = fixture(t); const store = createPluginTaskRecordStore(directory);
+ 	mkdirSync(join(directory, "folder.json")); assert.throws(() => store.get("folder"), /Unsafe/); assert.throws(() => store.list(), /Unsafe/);
+ 	rmSync(join(directory, "folder.json"), { recursive: true });
+-	const outside = join(directory, "outside.txt"); writeFileSync(outside, JSON.stringify(record())); symlinkSync(outside, join(directory, "task_one.json"));
++	const outside = join(directory, "outside.txt"); writeFileSync(outside, JSON.stringify(record()));
++	try { symlinkSync(outside, join(directory, "task_one.json")); } catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 	assert.throws(() => store.get("task_one"), /Unsafe/); assert.throws(() => store.list(), /Unsafe/);
+ });
+ 
+@@ -117,9 +118,12 @@ test("bootstrap recovery includes disabled packages, interrupts all unfinished r
+ 
+ test("bootstrap missing root stays missing, and unsafe package paths are per-package errors", t => {
+ 	const base = fixture(t); const missing = join(base, "missing"); assert.deepEqual(recoverPluginTaskRecords(missing), {}); assert(!existsSync(missing));
+-	const root = join(base, "root"); mkdirSync(root); symlinkSync(base, join(root, "unsafe-plugin")); mkdirSync(join(root, "Invalid_ID"));
++	const root = join(base, "root"); mkdirSync(root);
++	try { symlinkSync(base, join(root, "unsafe-plugin")); } catch { t.skip("symlinks need extra rights on this machine"); return; }
++	mkdirSync(join(root, "Invalid_ID"));
+ 	const errors = recoverPluginTaskRecords(root); assert.match(errors["unsafe-plugin"]!, /Unsafe/); assert.match(errors.Invalid_ID!, /Invalid plugin id/);
+-	const rootLink = join(base, "link"); symlinkSync(root, rootLink); assert.throws(() => recoverPluginTaskRecords(rootLink), /Unsafe/);
++	const rootLink = join(base, "link"); try { symlinkSync(root, rootLink); } catch { t.skip("symlinks need extra rights on this machine"); return; }
++	assert.throws(() => recoverPluginTaskRecords(rootLink), /Unsafe/);
+ });
+ 
+ test("core recovery uses only core-plugin-data, skips reserved community copies and includes disabled tasks", t => {
+@@ -143,7 +147,8 @@ test("recovery refuses symlinks at every root/plugin/data/tasks component and at
+ 		const base = fixture(t); const root = join(base, "plugins"); const directory = join(root, "fixture-plugin", "data", "tasks");
+ 		createPluginTaskRecordStore(directory).save(success());
+ 		const target = component === "root" ? root : component === "plugin" ? join(root, "fixture-plugin") : component === "data" ? join(root, "fixture-plugin", "data") : component === "tasks" ? directory : join(directory, "task_one.json");
+-		const moved = join(base, "moved"); renameSync(target, moved); symlinkSync(moved, target);
++		const moved = join(base, "moved"); renameSync(target, moved);
++		try { symlinkSync(moved, target); } catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		assert.throws(() => readPluginTaskRecord(root, "fixture-plugin", "task_one"), /Unsafe/);
+ 	}
+ });
+diff --git a/tests/plugin-types.test.ts b/tests/plugin-types.test.ts
+index 89935b5..6856fd2 100644
+--- a/tests/plugin-types.test.ts
++++ b/tests/plugin-types.test.ts
+@@ -6,7 +6,7 @@ import * as path from "node:path";
+ import * as os from "node:os";
+ import { it } from "node:test";
+ 
+-it("generated plugin API declarations are portable and usable as type-only imports", () => {
++it("generated plugin API declarations are portable and usable as type-only imports", (t) => {
+ 	const root = path.resolve(import.meta.dirname, "..");
+ 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-plugin-types-test-"));
+ 	try {
+@@ -17,7 +17,8 @@ it("generated plugin API declarations are portable and usable as type-only impor
+ 		assert.equal(fs.existsSync(path.join(output, "src", "server")), false, "No server implementation is part of the API tree");
+ 		// An author supplies the declared peer dependencies. This symlink is
+ 		// test-local, not a generated SDK reference to the source checkout.
+-		fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
++		try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
++		catch { t.skip("symlinks need extra rights on this machine"); return; }
+ 		const consumer = path.join(home, "consumer.mts");
+ 		fs.writeFileSync(consumer, `
+ import type { PluginBackendContext, PluginFrontendContext, PluginActionShortcut, PluginAgentTool, PluginMarkdownProps, PluginBadgeProps, GraphNode, GraphSnapshot } from "./api/index.d.ts";
+diff --git a/tests/plugin-view-types.test.ts b/tests/plugin-view-types.test.ts
+index ea04cea..aa93b9b 100644
+--- a/tests/plugin-view-types.test.ts
++++ b/tests/plugin-view-types.test.ts
+@@ -6,14 +6,15 @@ import * as path from "node:path";
+ import * as os from "node:os";
+ import test from "node:test";
+ 
+-test("portable SDK exposes whole-view context and deeply readonly drafts without submission capabilities", () => {
++test("portable SDK exposes whole-view context and deeply readonly drafts without submission capabilities", (t) => {
+   const root = path.resolve(import.meta.dirname, ".."), home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-plugin-view-types-"));
+   try {
+     const output = path.join(home, "api");
+     const build = spawnSync(process.execPath, [path.join(root, "scripts/build-plugin-types.mjs"), output], { cwd: root, encoding: "utf8", timeout: 120_000 });
+     assert.equal(build.status, 0, String(build.stdout) + String(build.stderr));
+     assert.equal(fs.existsSync(path.join(output, "src/server")), false);
+-    fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
++    try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
++    catch { t.skip("symlinks need extra rights on this machine"); return; }
+     const consumer = path.join(home, "consumer.mts");
+     fs.writeFileSync(consumer, `
+ import type { PluginFrontendContext, PluginSessionViewContext, PluginSessionViewInput, PluginNativeQuestionViewDraft, PluginSurfaceTarget } from "./api/index.d.ts";
+diff --git a/tests/session-identity.test.ts b/tests/session-identity.test.ts
+index 06a85e4..31b7290 100644
+--- a/tests/session-identity.test.ts
++++ b/tests/session-identity.test.ts
+@@ -49,7 +49,9 @@ function nativeCatalogFor(model: { provider: string; id: string }): ModelCatalog
+ async function closed<T>(run: () => Promise<T>): Promise<T> {
+ 	const env = process.env;
+ 	const fetch = globalThis.fetch;
+-	process.env = { NODE_ENV: "test", HOME: "/nonexistent/session-identity", OPENROUTER_API_KEY: "dummy-router", OPENCODE_API_KEY: "dummy-go", OPENAI_API_KEY: "dummy-openai" };
++	// Windows has no /tmp: os.tmpdir() needs TEMP (or TMP/TMPDIR) to stay sane.
++	const temps = Object.fromEntries(Object.entries({ TEMP: env.TEMP, TMP: env.TMP, TMPDIR: env.TMPDIR }).filter(([, value]) => value !== undefined));
++	process.env = { NODE_ENV: "test", HOME: "/nonexistent/session-identity", ...temps, OPENROUTER_API_KEY: "dummy-router", OPENCODE_API_KEY: "dummy-go", OPENAI_API_KEY: "dummy-openai" };
+ 	globalThis.fetch = async () => { throw new Error("CLOSED: unexpected fetch"); };
+ 	try { return await run(); } finally { process.env = env; globalThis.fetch = fetch; }
+ }
+diff --git a/tests/source-access.test.ts b/tests/source-access.test.ts
+index 832497d..2223e0e 100644
+--- a/tests/source-access.test.ts
++++ b/tests/source-access.test.ts
+@@ -30,8 +30,9 @@ async function write(relative: string, body = "LH_SYNTHETIC_SECRET_MARKER\n"): P
+ 	await fs.writeFile(file, body);
+ 	return file;
+ }
+-async function link(target: string, alias: string, directory = false): Promise<void> {
+-	await fs.symlink(target, alias, directory ? (process.platform === "win32" ? "junction" : "dir") : "file");
++async function link(target: string, alias: string, directory = false): Promise<boolean> {
++	try { await fs.symlink(target, alias, directory ? (process.platform === "win32" ? "junction" : "dir") : "file"); return true; }
++	catch { return false; }
+ }
+ 
+ await write("home/notes/topic.md", "ordinary study notes\n");
+@@ -47,14 +48,25 @@ const uuid = "12345678-1234-4123-8123-123456789abc";
+ const authTemp = await write(`keyfiles/custom-keys.json.tmp-${uuid}`);
+ for (const name of ["chatgpt", "github-copilot", "xai"]) await write(`keyfiles/${name}-credentials.json.${uuid}.tmp`);
+ const targetKey = await write("relocated-token");
+-await link(path.join(root, "keyfiles"), path.join(root, "private"), true);
+-await link(targetKey, auth);
+-await link(path.join(root, "transcripts"), path.join(home, ".claude"), true);
+-await link(path.join(home, ".ssh"), path.join(home, "notes", "keys"), true);
+-await link(targetKey, path.join(home, "notes", "key-alias"));
+-await link(authTemp, path.join(home, "notes", "key-temp-alias"));
+-await link(home, path.join(root, "home-alias"), true);
+-await link(home, path.join(root, "home-alias-2"), true);
++// Every fixture below is a symlink, which needs extra rights on some machines
++// (Windows without SeCreateSymbolicLinkPrivilege). Each one records its own
++// success: a failed alias protects nothing, so only the tests that depend on
++// that specific alias skip — ordinary credential-denial tests still run.
++interface FixtureLink { target: string; alias: string; directory: boolean; made: boolean }
++async function fixture(target: string, alias: string, directory = false): Promise<FixtureLink> {
++	const made = await link(target, alias, directory);
++	return { target, alias, directory, made };
++}
++const fixtures = {
++	credentialDir: await fixture(path.join(root, "keyfiles"), path.join(root, "private"), true),
++	auth: await fixture(targetKey, auth),
++	transcripts: await fixture(path.join(root, "transcripts"), path.join(home, ".claude"), true),
++	keys: await fixture(path.join(home, ".ssh"), path.join(home, "notes", "keys"), true),
++	keyAlias: await fixture(targetKey, path.join(home, "notes", "key-alias")),
++	keyTempAlias: await fixture(authTemp, path.join(home, "notes", "key-temp-alias")),
++	homeAlias: await fixture(home, path.join(root, "home-alias"), true),
++	homeAlias2: await fixture(home, path.join(root, "home-alias-2"), true),
++};
+ await write("keyfiles/data/chats/session.json", "synthetic learning conversation\n");
+ await write("keyfiles/logs/main.log", "ordinary synthetic app log\n");
+ await write("keyfiles/custom-keys.json.backup-not-managed", "ordinary file\n");
+@@ -81,19 +93,20 @@ async function text(tool: AgentTool<any>, args: unknown): Promise<string> {
+ const denied = /Access denied: .* is a protected location/;
+ 
+ describe("source access: configured credentials only", () => {
+-	const protectedFiles = [
+-		auth, targetKey, path.join(home, "notes", "key-alias"),
+-		authTemp, `${auth}.tmp-${uuid}`, path.join(home, "notes", "key-temp-alias"),
++	const protectedFiles: Array<[string, FixtureLink | undefined]> = [
++		[auth, fixtures.auth], [targetKey, fixtures.auth], [path.join(home, "notes", "key-alias"), fixtures.keyAlias],
++		[authTemp, undefined], [`${auth}.tmp-${uuid}`, fixtures.credentialDir], [path.join(home, "notes", "key-temp-alias"), fixtures.keyTempAlias],
+ 		...(["chatgpt", "github-copilot", "xai"].flatMap((name) => [
+-			path.join(root, "private", `${name}-credentials.json`),
+-			path.join(root, "keyfiles", `${name}-credentials.json`),
+-			path.join(root, "private", `${name}-credentials.json.${uuid}.tmp`),
+-			path.join(root, "keyfiles", `${name}-credentials.json.${uuid}.tmp`),
+-		])),
+-		path.join(root, "private", ".auth.json.tmp-123"), path.join(root, "keyfiles", ".auth.json.tmp-123"),
++			[path.join(root, "private", `${name}-credentials.json`), fixtures.credentialDir],
++			[path.join(root, "keyfiles", `${name}-credentials.json`), undefined],
++			[path.join(root, "private", `${name}-credentials.json.${uuid}.tmp`), fixtures.credentialDir],
++			[path.join(root, "keyfiles", `${name}-credentials.json.${uuid}.tmp`), undefined],
++		] as Array<[string, FixtureLink | undefined]>)),
++		[path.join(root, "private", ".auth.json.tmp-123"), fixtures.credentialDir], [path.join(root, "keyfiles", ".auth.json.tmp-123"), undefined],
+ 	];
+-	for (const file of protectedFiles) {
+-		it(`refuses read and direct grep of ${path.relative(root, file)}`, async () => {
++	for (const [file, prerequisite] of protectedFiles) {
++		it(`refuses read and direct grep of ${path.relative(root, file)}`, async (t) => {
++			if (prerequisite && !prerequisite.made) { t.skip("symlinks need extra rights on this machine"); return; }
+ 			await assert.rejects(readTool.execute!("s", { path: file }), denied);
+ 			await assert.rejects(grepTool.execute!("s", { path: file, pattern: "LH_SYNTHETIC_SECRET_MARKER" }), denied);
+ 		});
+@@ -108,7 +121,8 @@ describe("source access: configured credentials only", () => {
+ 		assert.match(await text(lsTool, { path: home }), /\.ssh\//);
+ 	});
+ 
+-	it("root-wide discovery omits credential targets, temp files, transcripts and dotenv contents", async () => {
++	it("root-wide discovery omits credential targets, temp files, transcripts and dotenv contents", async (t) => {
++		if (![fixtures.credentialDir, fixtures.auth, fixtures.transcripts].every((prerequisite) => prerequisite.made)) { t.skip("symlinks need extra rights on this machine"); return; }
+ 		assert.equal(await text(grepTool, { path: root, pattern: "LH_SYNTHETIC_SECRET_MARKER" }), "No matches found");
+ 		const found = await text(findTool, { path: root, pattern: "*" });
+ 		assert.match(found, /data\/chats\/session\.json/);
+@@ -133,8 +147,9 @@ describe("source access: configured credentials only", () => {
+ });
+ 
+ describe("source access: canonical roots and all tool paths", () => {
+-	for (const alias of [home, path.join(root, "home-alias"), path.join(root, "home-alias-2")]) {
+-		it(`find/grep/walk cannot bypass denials through ${path.basename(alias)}`, async () => {
++	for (const [alias, prerequisite] of [[home, undefined], [path.join(root, "home-alias"), fixtures.homeAlias], [path.join(root, "home-alias-2"), fixtures.homeAlias2]] as Array<[string, FixtureLink | undefined]>) {
++		it(`find/grep/walk cannot bypass denials through ${path.basename(alias)}`, async (t) => {
++			if (prerequisite && !prerequisite.made) { t.skip("symlinks need extra rights on this machine"); return; }
+ 			const found = await text(findTool, { path: alias, pattern: "*" });
+ 			assert.match(found, /notes\/topic\.md/);
+ 			assert.doesNotMatch(found, /id_ed25519|session\.jsonl/);
+@@ -146,8 +161,14 @@ describe("source access: canonical roots and all tool paths", () => {
+ 		});
+ 	}
+ 
+-	it("denies a sensitive directory's real target outside home, not only its symlink name", async () => {
+-		for (const folder of [path.join(home, ".claude"), path.join(root, "transcripts"), path.join(home, "notes", "keys")]) {
++	it("denies a sensitive directory's real target outside home, not only its symlink name", async (t) => {
++		const folders: Array<[string, FixtureLink]> = [
++			[path.join(home, ".claude"), fixtures.transcripts],
++			[path.join(root, "transcripts"), fixtures.transcripts],
++			[path.join(home, "notes", "keys"), fixtures.keys],
++		];
++		if (!folders.every(([, prerequisite]) => prerequisite.made)) { t.skip("symlinks need extra rights on this machine"); return; }
++		for (const [folder] of folders) {
+ 			await assert.rejects(lsTool.execute!("s", { path: folder }), denied);
+ 			await assert.rejects(findTool.execute!("s", { path: folder, pattern: "*" }), denied);
+ 			await assert.rejects(grepTool.execute!("s", { path: folder, pattern: "x" }), denied);
+@@ -156,7 +177,8 @@ describe("source access: canonical roots and all tool paths", () => {
+ 		await assert.rejects(readTool.execute!("s", { path: path.join(root, "transcripts", "projects", "session.jsonl") }), denied);
+ 	});
+ 
+-	it("canonicalizes an aliased HOME, including default and relative paths", async () => {
++	it("canonicalizes an aliased HOME, including default and relative paths", async (t) => {
++		if (!fixtures.homeAlias.made) { t.skip("symlinks need extra rights on this machine"); return; }
+ 		process.env.HOME = process.env.USERPROFILE = path.join(root, "home-alias");
+ 		try {
+ 			assert.equal(resolveSourcePath(), home);
+@@ -167,10 +189,10 @@ describe("source access: canonical roots and all tool paths", () => {
+ 		} finally { process.env.HOME = process.env.USERPROFILE = home; }
+ 	});
+ 
+-	it("a broken protected root does not disable ordinary reads, while source loops are never opened unchecked", async () => {
++	it("a broken protected root does not disable ordinary reads, while source loops are never opened unchecked", async (t) => {
+ 		const protectedLoop = path.join(home, ".gemini");
+ 		const ordinaryLoop = path.join(home, "notes", "loop");
+-		await link(protectedLoop, protectedLoop, true);
++		if (!await link(protectedLoop, protectedLoop, true)) { t.skip("symlinks need extra rights on this machine"); return; }
+ 		await link(ordinaryLoop, ordinaryLoop, true);
+ 		try {
+ 			assert.match(await text(readTool, { path: "notes/topic.md" }), /ordinary study notes/);
+@@ -182,9 +204,9 @@ describe("source access: canonical roots and all tool paths", () => {
+ 		}
+ 	});
+ 
+-	it("uses the checked target for an ordinary file alias, and preserves missing-file errors", async () => {
++	it("uses the checked target for an ordinary file alias, and preserves missing-file errors", async (t) => {
+ 		const alias = path.join(home, "notes", "topic-alias");
+-		await link(path.join(home, "notes", "topic.md"), alias);
++		if (!await link(path.join(home, "notes", "topic.md"), alias)) { t.skip("symlinks need extra rights on this machine"); return; }
+ 		assert.equal(resolveSourcePath(alias), path.join(home, "notes", "topic.md"));
+ 		assert.match(await text(readTool, { path: alias }), /ordinary study notes/);
+ 		await assert.rejects(readTool.execute!("s", { path: "notes/absent" }), /ENOENT/);
+@@ -192,10 +214,10 @@ describe("source access: canonical roots and all tool paths", () => {
+ 	});
+ 
+ 	for (const name of [".env", ".env.example", ".env.template", ".ENV.production"]) {
+-		it(`denies ${name} outside home, including through a differently named alias`, async () => {
++		it(`denies ${name} outside home, including through a differently named alias`, async (t) => {
+ 			const file = path.join(root, "elsewhere", name);
+ 			const alias = path.join(home, "notes", `alias-${name}`);
+-			await link(file, alias);
++			if (!await link(file, alias)) { t.skip("symlinks need extra rights on this machine"); return; }
+ 			await assert.rejects(readTool.execute!("s", { path: file }), denied);
+ 			await assert.rejects(readTool.execute!("s", { path: alias }), denied);
+ 		});
+@@ -223,7 +245,8 @@ describe("source access: canonical roots and all tool paths", () => {
+ 		await assert.rejects(readTool.execute!("s", { path: protectedImage }), denied);
+ 	});
+ 
+-	it("PDF denial is a structured upfront failure before parsing, rendering or model calls", async () => {
++	it("PDF denial is a structured upfront failure before parsing, rendering or model calls", async (t) => {
++		if (!fixtures.transcripts.made) { t.skip("symlinks need extra rights on this machine"); return; }
+ 		const faux = createFauxCore({ tokenSize: { min: 64, max: 64 } });
+ 		let modelCalls = 0;
+ 		const engine = { model: faux.getModel(), streamFn: (() => { modelCalls++; throw new Error("must not call model"); }) as typeof faux.streamSimple };
+@@ -268,7 +291,10 @@ describe("source access: case-sensitive home-location variants", () => {
+ 		await write("variant-vault/key", "CASE_VARIANT_SECRET\n");
+ 		await write("variant-cloud-vault/key", "CASE_VARIANT_SECRET\n");
+ 		await fs.rename(ssh, saved);
+-		await link(vault, upperSsh, true);
++		if (!await link(vault, upperSsh, true)) {
++			await fs.rename(saved, ssh);
++			t.skip("symlinks need extra rights on this machine"); return;
++		}
+ 		await fs.mkdir(upperConfig);
+ 		await link(cloudVault, path.join(upperConfig, "GCLOUD"), true);
+ 		const native = realpathSync.native;
+@@ -313,6 +339,7 @@ describe("source access: credential case aliases on the fixture filesystem", ()
+ 	}
+ 
+ 	it("refuses differently cased credential filenames, directories, real targets and temporary files", async (t) => {
++		if (![fixtures.credentialDir, fixtures.auth].every((prerequisite) => prerequisite.made)) { t.skip("symlinks need extra rights on this machine"); return; }
+ 		if (!await caseAliasesAvailable()) return t.skip("fixture filesystem is case-sensitive");
+ 		const aliases = [
+ 			path.join(root, "keyfiles", "CHATGPT-CREDENTIALS.JSON"),
+@@ -340,6 +367,7 @@ describe("source access: credential case aliases on the fixture filesystem", ()
+ 	});
+ 
+ 	it("protects a non-symlink configured AUTH_FILE regardless of filename or parent-directory case", async (t) => {
++		if (!fixtures.auth.made) { t.skip("symlinks need extra rights on this machine"); return; }
+ 		if (!await caseAliasesAvailable()) return t.skip("fixture filesystem is case-sensitive");
+ 		await fs.unlink(auth);
+ 		await fs.writeFile(auth, "LH_SYNTHETIC_SECRET_MARKER\n");
+diff --git a/tests/subscription-auth.test.ts b/tests/subscription-auth.test.ts
+index 8cc4715..5df3b31 100644
+--- a/tests/subscription-auth.test.ts
++++ b/tests/subscription-auth.test.ts
+@@ -48,7 +48,7 @@ for (const id of ids) test(`${id}: independent default-ON file, restart, explici
+ 		await f.controller.login(id, false);
+ 		const saved = JSON.parse(await fs.readFile(path.join(f.directory, `${id}-credentials.json`), "utf8"));
+ 		assert.equal(saved.version, 1); assert.equal(saved.credential.type, "oauth"); assert.equal(saved.allowBackgroundUse, false);
+-		assert.equal((await fs.stat(path.join(f.directory, `${id}-credentials.json`))).mode & 0o777, 0o600);
++		if (process.platform !== "win32") assert.equal((await fs.stat(path.join(f.directory, `${id}-credentials.json`))).mode & 0o777, 0o600);
+ 		const publicState = JSON.stringify(await f.controller.snapshot());
+ 		assert(!publicState.includes(saved.credential.access)); assert(!publicState.includes(saved.credential.refresh));
+ 		const scope = await f.scope(id), result = await f.controller.lease(scope, false);
+diff --git a/tests/themes.test.ts b/tests/themes.test.ts
+index fcbb5bd..36e160f 100644
+--- a/tests/themes.test.ts
++++ b/tests/themes.test.ts
+@@ -93,7 +93,7 @@ function cssBlock(css: string, selector: string): Map<string, string> {
+ 
+ describe("themeVars — the adapter", () => {
+ 	it("Default reproduces app/globals.css's literals exactly", () => {
+-		const css = fs.readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
++		const css = fs.readFileSync(new URL("../app/globals.css", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+ 		const block = cssBlock(css, ":root,\n.dark");
+ 		for (const [token, value] of Object.entries(themeVars(DEFAULT_THEME.colors, "dark"))) {
+ 			assert.equal(block.get(token), value, token);
+diff --git a/tests/verify-release.test.ts b/tests/verify-release.test.ts
+index ad60656..ed1d14b 100644
+--- a/tests/verify-release.test.ts
++++ b/tests/verify-release.test.ts
+@@ -367,7 +367,9 @@ describe("release gate — CLI (offline, repo config)", () => {
+ 	// intentionally stay at 0.2.0. A release version bump must not break tests.
+ 	const VERSION = (JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8")) as { version: string }).version;
+ 	const TAG = `v${VERSION}`;
+-	const tsxImport = fileURLToPath(import.meta.resolve("tsx"));
++	// `--import` needs a URL: on Windows a bare `C:\…` path is read as a
++	// scheme and the loader refuses it (ERR_UNSUPPORTED_ESM_URL_SCHEME).
++	const tsxImport = import.meta.resolve("tsx");
+ 	function run(args: string[], cwd = repoRoot) {
+ 		return spawnSync(process.execPath, ["--import", tsxImport, script, ...args], {
+ 			cwd, encoding: "utf8", timeout: 60_000,
+-- 
+2.53.0.windows.1
+
