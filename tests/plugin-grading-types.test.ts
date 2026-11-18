@@ -6,7 +6,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { it } from "node:test";
 
-it("portable public SDK supports typed generic grading without exposing host authority or presentation policy", () => {
+it("portable public SDK supports typed generic grading without exposing host authority or presentation policy", (t) => {
 	const root = path.resolve(import.meta.dirname, "..");
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-plugin-grading-types-test-"));
 	try {
@@ -14,7 +14,8 @@ it("portable public SDK supports typed generic grading without exposing host aut
 		const build = spawnSync(process.execPath, [path.join(root, "scripts", "build-plugin-types.mjs"), output], { cwd: root, encoding: "utf8", timeout: 120_000 });
 		assert.equal(build.status, 0, String(build.stdout) + String(build.stderr));
 		assert.equal(fs.existsSync(path.join(output, "src/server")), false);
-		fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
+		try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
+		catch { t.skip("symlinks need extra rights on this machine"); return; }
 		const consumer = path.join(home, "consumer.mts");
 		fs.writeFileSync(consumer, `
 import { Type } from "typebox";

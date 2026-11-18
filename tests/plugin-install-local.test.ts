@@ -82,7 +82,7 @@ it("checks portable manifest structural rules against the host contract", () => 
 		installPluginLocal({ project, pluginsDirectory: directory });
 	}
 }));
-it("refuses non-distributable contents, file and directory symlinks, including manifest and root links", () => {
+it("refuses non-distributable contents, file and directory symlinks, including manifest and root links", (t) => {
 	for (const mode of ["data", "nested-data", "credentials", "manifest-link", "asset-link", "asset-parent-link", "dist-link", "project-link", "directory-link"]) fixture(({ root, project, directory, installed, write }) => {
 		if (mode === "data") write("source project/dist/data/private.json", "private");
 		if (mode === "nested-data") write("source project/dist/assets/data/private.json", "private");
@@ -90,22 +90,39 @@ it("refuses non-distributable contents, file and directory symlinks, including m
 		if (["manifest-link", "asset-link", "asset-parent-link", "dist-link"].includes(mode)) {
 			const entry = mode === "manifest-link" ? "manifest.json" : mode === "asset-link" ? "assets/chunk.js" : mode === "asset-parent-link" ? "assets" : "";
 			const source = path.join(project, "dist", entry), target = path.join(root, "external");
-			fs.renameSync(source, target); fs.symlinkSync(target, source, fs.statSync(target).isDirectory() ? "dir" : "file");
+			fs.renameSync(source, target);
+			try { fs.symlinkSync(target, source, fs.statSync(target).isDirectory() ? "dir" : "file"); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
 		}
 		let source = project, target = directory;
-		if (mode === "project-link") { source = path.join(root, "project-link"); fs.symlinkSync(project, source, "dir"); }
-		if (mode === "directory-link") { target = path.join(root, "directory-link"); fs.symlinkSync(directory, target, "dir"); }
+		if (mode === "project-link") {
+			source = path.join(root, "project-link");
+			try { fs.symlinkSync(project, source, "dir"); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
+		}
+		if (mode === "directory-link") {
+			target = path.join(root, "directory-link");
+			try { fs.symlinkSync(directory, target, "dir"); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
+		}
 		assert.throws(() => installPluginLocal({ project: source, pluginsDirectory: target }), /Refusing/);
 		unchanged(installed);
 	});
 });
-it("refuses linked target plugin/dist and misplaced target dist/data, even dangling links", () => {
+it("refuses linked target plugin/dist and misplaced target dist/data, even dangling links", (t) => {
 	for (const mode of ["plugin", "dist", "data", "dangling-data"]) fixture(({ root, project, directory, installed }) => {
 		const source = mode === "plugin" ? installed : mode === "dist" ? path.join(installed, "dist") : path.join(installed, "dist/data");
 		const external = path.join(root, "external");
-		if (mode === "plugin" || mode === "dist") { fs.renameSync(source, external); fs.symlinkSync(external, source, "dir"); }
+		if (mode === "plugin" || mode === "dist") {
+			fs.renameSync(source, external);
+			try { fs.symlinkSync(external, source, "dir"); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
+		}
 		else if (mode === "data") fs.mkdirSync(source);
-		else fs.symlinkSync(external, source, "dir");
+		else {
+			try { fs.symlinkSync(external, source, "dir"); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
+		}
 		assert.throws(() => installPluginLocal({ project, pluginsDirectory: directory }), /Refusing/);
 		assert.equal(fs.readFileSync(path.join(installed, "dist/main.js"), "utf8"), "old code");
 		assert.equal(fs.readFileSync(path.join(installed, "data/private.json"), "utf8"), "installed data");
@@ -141,7 +158,10 @@ it("the documented npm command builds and installs without a checkout, and build
 	write("source project/package.json", JSON.stringify({ private: true, scripts: { build: 'node -e "process.exit(Number(process.env.FAIL_BUILD || 0))"', "install:local": "npm run build && node scripts/install-plugin-local.mjs" } }));
 	const npm = process.env.npm_execpath;
 	assert.ok(npm, "test must run under npm");
-	const execute = (fail: string) => spawnSync(process.execPath, [npm, "run", "install:local", "--", directory], { cwd: project, encoding: "utf8", env: { ...process.env, HOME: root, FAIL_BUILD: fail } });
+	// npm double-escapes arguments when it resolves npm.CMD (cmd.exe path), mangling a directory containing spaces;
+	// a real shell passes the documented `-- "<dir>"` argument through unchanged.
+	const scriptShell = ["C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"].find(file => fs.existsSync(file));
+	const execute = (fail: string) => spawnSync(process.execPath, [npm, "run", "install:local", "--", directory], { cwd: project, encoding: "utf8", env: { ...process.env, HOME: root, FAIL_BUILD: fail, ...(scriptShell ? { npm_config_script_shell: scriptShell } : {}) } });
 	const failed = execute("1"); assert.equal(failed.status, 1, failed.stderr); unchanged(installed);
 	const success = execute("0"); assert.equal(success.status, 0, success.stderr);
 	assert.match(success.stdout, /Installed:/);

@@ -140,22 +140,26 @@ it("regenerates deterministic dev and standalone archives without stale expanded
 	assert.equal(packaged.directory, path.join(root, ".next/standalone/plugin-authoring"));
 }));
 
-it("refuses unsafe example contents, source symlinks and output symlinks without changing their targets", () => {
+it("refuses unsafe example contents, source symlinks and output symlinks without changing their targets", (t) => {
 	for (const mode of ["data", "credentials", "source-link", "output-link", "dangling-output-link"]) fixture(root => {
 		const dist = path.join(root, "examples/plugins/hello-plugin/dist");
 		const outside = path.join(root, "keep.txt"); fs.writeFileSync(outside, "preserve");
 		if (mode === "data") fs.mkdirSync(path.join(dist, "data"));
 		if (mode === "credentials") fs.writeFileSync(path.join(dist, ".env.local"), "private");
-		if (mode === "source-link") fs.symlinkSync(outside, path.join(dist, "linked.js"));
+		if (mode === "source-link") {
+			try { fs.symlinkSync(outside, path.join(dist, "linked.js")); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
+		}
 		if (mode.includes("output-link")) {
 			fs.mkdirSync(path.join(root, "public"));
-			fs.symlinkSync(mode.startsWith("dangling") ? path.join(root, "missing") : root, path.join(root, "public/plugin-authoring"), "dir");
+			try { fs.symlinkSync(mode.startsWith("dangling") ? path.join(root, "missing") : root, path.join(root, "public/plugin-authoring"), "dir"); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
 		}
 		assert.throws(() => buildPluginAuthoring({ root }), /Refusing/);
 		assert.equal(fs.readFileSync(outside, "utf8"), "preserve");
 	});
 });
-it("rejects every curated source-file symlink before replacing existing outputs", () => {
+it("rejects every curated source-file symlink before replacing existing outputs", (t) => {
 	for (const relative of ["skills/learnharness-plugins/SKILL.md", "package.json", "LICENSE", "docs/plugin-authoring.md", "skills/learnharness-plugins/README.md", "examples/plugins/hello-plugin/README.md", "examples/plugins/hello-plugin/dist/manifest.json", "examples/plugins/hello-plugin/dist/main.js", "scripts/build-plugin-types.mjs", "scripts/build-plugin-api-reference.mjs", "scripts/install-plugin-local.mjs", "plugins/flashcards/src/main.js", "plugins/ui-showcase/README.md"]) fixture(root => {
 		const built = buildPluginAuthoring({ root });
 		const archive = fs.readFileSync(built.archive), skill = fs.readFileSync(path.join(built.directory, "SKILL.md"));
@@ -163,14 +167,16 @@ it("rejects every curated source-file symlink before replacing existing outputs"
 		try {
 			const source = path.join(root, relative), target = path.join(external, path.basename(source));
 			fs.copyFileSync(source, target);
-			fs.unlinkSync(source); fs.symlinkSync(target, source);
+			fs.unlinkSync(source);
+			try { fs.symlinkSync(target, source); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
 			assert.throws(() => buildPluginAuthoring({ root }), /Refusing.*symlink/, relative);
 			assert.deepEqual(fs.readFileSync(built.archive), archive, relative);
 			assert.deepEqual(fs.readFileSync(path.join(built.directory, "SKILL.md")), skill, relative);
 		} finally { fs.rmSync(external, { recursive: true, force: true }); }
 	});
 });
-it("rejects source ancestor-directory symlinks before replacing existing outputs", () => {
+it("rejects source ancestor-directory symlinks before replacing existing outputs", (t) => {
 	for (const relative of ["docs", "skills", "skills/learnharness-plugins", "examples", "examples/plugins", "examples/plugins/hello-plugin", "examples/plugins/hello-plugin/dist", "scripts", "plugins", "plugins/flashcards", "plugins/flashcards/src"]) fixture(root => {
 		const built = buildPluginAuthoring({ root });
 		const archive = fs.readFileSync(built.archive), skill = fs.readFileSync(path.join(built.directory, "SKILL.md"));
@@ -178,7 +184,9 @@ it("rejects source ancestor-directory symlinks before replacing existing outputs
 		try {
 			const source = path.join(root, relative), target = path.join(external, "source");
 			fs.cpSync(source, target, { recursive: true });
-			fs.rmSync(source, { recursive: true }); fs.symlinkSync(target, source, "dir");
+			fs.rmSync(source, { recursive: true });
+			try { fs.symlinkSync(target, source, "dir"); }
+			catch { t.skip("symlinks need extra rights on this machine"); return; }
 			assert.throws(() => buildPluginAuthoring({ root }), /Refusing.*symlink/, relative);
 			assert.deepEqual(fs.readFileSync(built.archive), archive, relative);
 			assert.deepEqual(fs.readFileSync(path.join(built.directory, "SKILL.md")), skill, relative);

@@ -156,11 +156,12 @@ describe("learner image source safety", () => {
 		finally { clearTimeout(timer); }
 	});
 
-	it("uses the shared sensitive-path guard for displays and annotation dispatch", async () => {
+	it("uses the shared sensitive-path guard for displays and annotation dispatch", async (t) => {
 		const home = await fs.mkdtemp(path.join(scratch, "home-"));
 		await fs.mkdir(path.join(home, ".claude"));
 		await fs.writeFile(path.join(home, ".claude", "private.png"), picture());
-		await fs.symlink(path.join(home, ".claude"), path.join(home, "alias"));
+		try { await fs.symlink(path.join(home, ".claude"), path.join(home, "alias")); }
+		catch { t.skip("symlinks need extra rights on this machine"); return; }
 		const old = process.env.HOME;
 		try {
 			process.env.HOME = home;

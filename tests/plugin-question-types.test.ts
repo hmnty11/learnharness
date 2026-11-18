@@ -6,7 +6,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { it } from "node:test";
 
-it("packaged question SDK contracts support strict consumers without exposing host authority APIs", () => {
+it("packaged question SDK contracts support strict consumers without exposing host authority APIs", (t) => {
 	const root = path.resolve(import.meta.dirname, "..");
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-question-types-test-"));
 	try {
@@ -15,7 +15,8 @@ it("packaged question SDK contracts support strict consumers without exposing ho
 		assert.equal(build.status, 0, String(build.stdout) + String(build.stderr));
 		assert.ok(fs.existsSync(path.join(output, "src/core/plugin-questions.d.ts")));
 		assert.equal(fs.existsSync(path.join(output, "src/server")), false);
-		fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir");
+		try { fs.symlinkSync(path.join(root, "node_modules"), path.join(home, "node_modules"), "dir"); }
+		catch { t.skip("symlinks need extra rights on this machine"); return; }
 		const consumer = path.join(home, "consumer.mts");
 		fs.writeFileSync(consumer, `
 import { Type } from "typebox";

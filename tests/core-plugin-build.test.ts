@@ -47,11 +47,11 @@ test("failed builds/validation leave the previous staged tree intact", () => fix
 	assert.equal(fs.readFileSync(path.join(out, "previous"), "utf8"), "keep");
 }));
 
-test("staging rejects data, credentials, source/tooling and symlinks instead of copying them", () => {
+test("staging rejects data, credentials, source/tooling and symlinks instead of copying them", (t) => {
 	for (const entry of ["data/private.json", "auth.json", ".env", "tests/test.js", "node_modules/x/index.js", "src/main.ts", "linked"]) fixture(root => {
 		const code = path.join(root, "plugins", "one", "dist"); const file = path.join(code, entry);
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		if (entry === "linked") fs.symlinkSync(path.join(code, "main.js"), file); else fs.writeFileSync(file, "private");
+		if (entry === "linked") { try { fs.symlinkSync(path.join(code, "main.js"), file); } catch { t.skip("symlinks need extra rights on this machine"); return; } } else fs.writeFileSync(file, "private");
 		assert.throws(() => buildCorePlugins(root, { run() {} }), /Unsafe|Refusing/);
 		assert.equal(fs.existsSync(path.join(root, "core-plugins")), false);
 	});

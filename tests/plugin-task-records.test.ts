@@ -59,7 +59,8 @@ test("strict get/list refuse task files that are directories or symlinks", t => 
 	const directory = fixture(t); const store = createPluginTaskRecordStore(directory);
 	mkdirSync(join(directory, "folder.json")); assert.throws(() => store.get("folder"), /Unsafe/); assert.throws(() => store.list(), /Unsafe/);
 	rmSync(join(directory, "folder.json"), { recursive: true });
-	const outside = join(directory, "outside.txt"); writeFileSync(outside, JSON.stringify(record())); symlinkSync(outside, join(directory, "task_one.json"));
+	const outside = join(directory, "outside.txt"); writeFileSync(outside, JSON.stringify(record()));
+	try { symlinkSync(outside, join(directory, "task_one.json")); } catch { t.skip("symlinks need extra rights on this machine"); return; }
 	assert.throws(() => store.get("task_one"), /Unsafe/); assert.throws(() => store.list(), /Unsafe/);
 });
 
@@ -117,9 +118,12 @@ test("bootstrap recovery includes disabled packages, interrupts all unfinished r
 
 test("bootstrap missing root stays missing, and unsafe package paths are per-package errors", t => {
 	const base = fixture(t); const missing = join(base, "missing"); assert.deepEqual(recoverPluginTaskRecords(missing), {}); assert(!existsSync(missing));
-	const root = join(base, "root"); mkdirSync(root); symlinkSync(base, join(root, "unsafe-plugin")); mkdirSync(join(root, "Invalid_ID"));
+	const root = join(base, "root"); mkdirSync(root);
+	try { symlinkSync(base, join(root, "unsafe-plugin")); } catch { t.skip("symlinks need extra rights on this machine"); return; }
+	mkdirSync(join(root, "Invalid_ID"));
 	const errors = recoverPluginTaskRecords(root); assert.match(errors["unsafe-plugin"]!, /Unsafe/); assert.match(errors.Invalid_ID!, /Invalid plugin id/);
-	const rootLink = join(base, "link"); symlinkSync(root, rootLink); assert.throws(() => recoverPluginTaskRecords(rootLink), /Unsafe/);
+	const rootLink = join(base, "link"); try { symlinkSync(root, rootLink); } catch { t.skip("symlinks need extra rights on this machine"); return; }
+	assert.throws(() => recoverPluginTaskRecords(rootLink), /Unsafe/);
 });
 
 test("core recovery uses only core-plugin-data, skips reserved community copies and includes disabled tasks", t => {
@@ -143,7 +147,8 @@ test("recovery refuses symlinks at every root/plugin/data/tasks component and at
 		const base = fixture(t); const root = join(base, "plugins"); const directory = join(root, "fixture-plugin", "data", "tasks");
 		createPluginTaskRecordStore(directory).save(success());
 		const target = component === "root" ? root : component === "plugin" ? join(root, "fixture-plugin") : component === "data" ? join(root, "fixture-plugin", "data") : component === "tasks" ? directory : join(directory, "task_one.json");
-		const moved = join(base, "moved"); renameSync(target, moved); symlinkSync(moved, target);
+		const moved = join(base, "moved"); renameSync(target, moved);
+		try { symlinkSync(moved, target); } catch { t.skip("symlinks need extra rights on this machine"); return; }
 		assert.throws(() => readPluginTaskRecord(root, "fixture-plugin", "task_one"), /Unsafe/);
 	}
 });

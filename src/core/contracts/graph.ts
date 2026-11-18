@@ -86,6 +86,12 @@ export interface NotesSource {
 	 * ignored: every explicit notes import processes the whole file. New
 	 * imports do not compute or write this field. No migration is needed. */
 	contentFp?: string;
+	/** Incomplete-run checkpoint: the chunking inputs' fingerprint plus the
+	 * leading chunks already merged. Written after each merged chunk and
+	 * cleared when a run completes, so a stopped import of the same file
+	 * text resumes at `done` instead of re-paying earlier chunks. A changed
+	 * file (or chunk size) has a different fp and starts from the top. */
+	resume?: { fp: string; chunks: number; done: number };
 	/** The run's usage log — same append-only discipline as
 	 *  ChatRecord.extractions, idempotent per startedAt. */
 	extractions?: ExtractionRunUsage[];

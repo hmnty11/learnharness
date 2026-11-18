@@ -14,9 +14,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { describe, it } from "node:test";
+import { pathToFileURL } from "node:url";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "..");
-const TSX_LOADER = path.join(REPO_ROOT, "node_modules", "tsx", "dist", "loader.mjs");
+// `--import` and import specifiers need URLs: a bare `C:\…` path is parsed
+// as a "c:" scheme by the ESM loader on Windows.
+const TSX_LOADER = pathToFileURL(path.join(REPO_ROOT, "node_modules", "tsx", "dist", "loader.mjs")).href;
+const CONFIG_URL = pathToFileURL(path.join(REPO_ROOT, "config.ts")).href;
 
 describe("LH_DATA_DIR seam", () => {
 	it("relocates data/chats/graph under LH_DATA_DIR, keeps prompts ROOT-anchored", async () => {
@@ -40,7 +44,7 @@ describe("LH_DATA_DIR seam", () => {
 	it("unset = the repo data/ exactly as before (fresh child process, no env)", () => {
 		const out = execFileSync(
 			process.execPath,
-			["--import", TSX_LOADER, "--eval", `const m = await import(${JSON.stringify(path.join(REPO_ROOT, "config.ts"))}); console.log(JSON.stringify({ data: m.PATHS.data, chats: m.PATHS.chats }));`],
+			["--import", TSX_LOADER, "--eval", `const m = await import(${JSON.stringify(CONFIG_URL)}); console.log(JSON.stringify({ data: m.PATHS.data, chats: m.PATHS.chats }));`],
 			{ cwd: REPO_ROOT, encoding: "utf-8" },
 		);
 		const parsed = JSON.parse(out) as { data: string; chats: string | null };

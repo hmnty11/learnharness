@@ -40,10 +40,12 @@ describe("AuthStore adapter", () => {
 
 	it("the file is mode 0600 (secrets), also after rewrites", () => {
 		authStore.setAuthVar("DEEPGRAM_API_KEY", "d".repeat(40));
-		const first = fs.statSync(AUTH_FILE).mode & 0o777;
-		assert.equal(first, 0o600);
+		if (process.platform !== "win32") {
+			const first = fs.statSync(AUTH_FILE).mode & 0o777;
+			assert.equal(first, 0o600);
+		}
 		authStore.setAuthVar("DEEPGRAM_API_KEY", "e".repeat(40));
-		assert.equal(fs.statSync(AUTH_FILE).mode & 0o777, 0o600, "rewrite keeps 0600");
+		if (process.platform !== "win32") assert.equal(fs.statSync(AUTH_FILE).mode & 0o777, 0o600, "rewrite keeps 0600");
 	});
 
 	it("set preserves unknown vars verbatim (forward-compat)", () => {

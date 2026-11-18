@@ -114,6 +114,8 @@ npm run build          # Next production build
 
 The suite requires no paid models or real sign-in. Some tests use temporary files, native processes, or local fake endpoints: deterministic does not mean every test is pure or cannot bind a loopback port. Inspect focused-suite setup before running beside a live app.
 
+On Windows, use Node 26 and run `NODE_ENV=test npx tsx --test "tests/*.test.ts" "tests/*.test.tsx"` from Git Bash; `npm test` uses POSIX environment-variable syntax. Symlink tests skip when the OS denies link creation. POSIX permission-bit and signal-escalation assertions run only where supported; file contents and cleanup still run on Windows. Generated Markdown comparisons ignore CRLF checkout differences.
+
 [Golden fixtures](../tests/fixtures/golden-data/README.md) exercise saved records through production paths. Keep compatibility expectations with intentional format changes; do not hand-edit fixture content to make tests pass. [Standalone skill-reader tests](../tests/skills/README.md) run separately with Python and no app runtime.
 
 Additional runtime gates have prerequisites:

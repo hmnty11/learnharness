@@ -86,15 +86,17 @@ describe("strict persisted file-access policy", () => {
 		assert.equal(readFileAccessSettings().ok, false);
 		assert.throws(() => resolveSourcePath(path.join(a, "notes.md")), blocked);
 	});
-	it("directories, dangling settings symlinks and dangling data-directory symlinks are not first boot", async () => {
+	it("directories, dangling settings symlinks and dangling data-directory symlinks are not first boot", async (t) => {
 		await fs.mkdir(SETTINGS_FILE);
 		assert.equal(readFileAccessSettings().ok, false);
 		await fs.rmdir(SETTINGS_FILE);
-		await fs.symlink(path.join(root, "missing-settings.json"), SETTINGS_FILE, "file");
+		try { await fs.symlink(path.join(root, "missing-settings.json"), SETTINGS_FILE, "file"); }
+		catch { t.skip("symlinks need extra rights on this machine"); return; }
 		assert.equal(readFileAccessSettings().ok, false);
 		await fs.unlink(SETTINGS_FILE);
 		await fs.rmdir(data);
-		await fs.symlink(path.join(root, "missing-data"), data, process.platform === "win32" ? "junction" : "dir");
+		try { await fs.symlink(path.join(root, "missing-data"), data, process.platform === "win32" ? "junction" : "dir"); }
+		catch { await fs.mkdir(data); t.skip("symlinks need extra rights on this machine"); return; }
 		try { assert.equal(readFileAccessSettings().ok, false); }
 		finally { await fs.unlink(data); await fs.mkdir(data); }
 	});

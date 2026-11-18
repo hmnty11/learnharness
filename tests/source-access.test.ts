@@ -30,8 +30,9 @@ async function write(relative: string, body = "LH_SYNTHETIC_SECRET_MARKER\n"): P
 	await fs.writeFile(file, body);
 	return file;
 }
-async function link(target: string, alias: string, directory = false): Promise<void> {
-	await fs.symlink(target, alias, directory ? (process.platform === "win32" ? "junction" : "dir") : "file");
+async function link(target: string, alias: string, directory = false): Promise<boolean> {
+	try { await fs.symlink(target, alias, directory ? (process.platform === "win32" ? "junction" : "dir") : "file"); return true; }
+	catch { return false; }
 }
 
 await write("home/notes/topic.md", "ordinary study notes\n");
@@ -47,14 +48,25 @@ const uuid = "12345678-1234-4123-8123-123456789abc";
 const authTemp = await write(`keyfiles/custom-keys.json.tmp-${uuid}`);
 for (const name of ["chatgpt", "github-copilot", "xai"]) await write(`keyfiles/${name}-credentials.json.${uuid}.tmp`);
 const targetKey = await write("relocated-token");
-await link(path.join(root, "keyfiles"), path.join(root, "private"), true);
-await link(targetKey, auth);
-await link(path.join(root, "transcripts"), path.join(home, ".claude"), true);
-await link(path.join(home, ".ssh"), path.join(home, "notes", "keys"), true);
-await link(targetKey, path.join(home, "notes", "key-alias"));
-await link(authTemp, path.join(home, "notes", "key-temp-alias"));
-await link(home, path.join(root, "home-alias"), true);
-await link(home, path.join(root, "home-alias-2"), true);
+// Every fixture below is a symlink, which needs extra rights on some machines
+// (Windows without SeCreateSymbolicLinkPrivilege). Each one records its own
+// success: a failed alias protects nothing, so only the tests that depend on
+// that specific alias skip — ordinary credential-denial tests still run.
+interface FixtureLink { target: string; alias: string; directory: boolean; made: boolean }
+async function fixture(target: string, alias: string, directory = false): Promise<FixtureLink> {
+	const made = await link(target, alias, directory);
+	return { target, alias, directory, made };
+}
+const fixtures = {
+	credentialDir: await fixture(path.join(root, "keyfiles"), path.join(root, "private"), true),
+	auth: await fixture(targetKey, auth),
+	transcripts: await fixture(path.join(root, "transcripts"), path.join(home, ".claude"), true),
+	keys: await fixture(path.join(home, ".ssh"), path.join(home, "notes", "keys"), true),
+	keyAlias: await fixture(targetKey, path.join(home, "notes", "key-alias")),
+	keyTempAlias: await fixture(authTemp, path.join(home, "notes", "key-temp-alias")),
+	homeAlias: await fixture(home, path.join(root, "home-alias"), true),
+	homeAlias2: await fixture(home, path.join(root, "home-alias-2"), true),
+};
 await write("keyfiles/data/chats/session.json", "synthetic learning conversation\n");
 await write("keyfiles/logs/main.log", "ordinary synthetic app log\n");
 await write("keyfiles/custom-keys.json.backup-not-managed", "ordinary file\n");
@@ -81,19 +93,20 @@ async function text(tool: AgentTool<any>, args: unknown): Promise<string> {
 const denied = /Access denied: .* is a protected location/;
 
 describe("source access: configured credentials only", () => {
-	const protectedFiles = [
-		auth, targetKey, path.join(home, "notes", "key-alias"),
-		authTemp, `${auth}.tmp-${uuid}`, path.join(home, "notes", "key-temp-alias"),
+	const protectedFiles: Array<[string, FixtureLink | undefined]> = [
+		[auth, fixtures.auth], [targetKey, fixtures.auth], [path.join(home, "notes", "key-alias"), fixtures.keyAlias],
+		[authTemp, undefined], [`${auth}.tmp-${uuid}`, fixtures.credentialDir], [path.join(home, "notes", "key-temp-alias"), fixtures.keyTempAlias],
 		...(["chatgpt", "github-copilot", "xai"].flatMap((name) => [
-			path.join(root, "private", `${name}-credentials.json`),
-			path.join(root, "keyfiles", `${name}-credentials.json`),
-			path.join(root, "private", `${name}-credentials.json.${uuid}.tmp`),
-			path.join(root, "keyfiles", `${name}-credentials.json.${uuid}.tmp`),
-		])),
-		path.join(root, "private", ".auth.json.tmp-123"), path.join(root, "keyfiles", ".auth.json.tmp-123"),
+			[path.join(root, "private", `${name}-credentials.json`), fixtures.credentialDir],
+			[path.join(root, "keyfiles", `${name}-credentials.json`), undefined],
+			[path.join(root, "private", `${name}-credentials.json.${uuid}.tmp`), fixtures.credentialDir],
+			[path.join(root, "keyfiles", `${name}-credentials.json.${uuid}.tmp`), undefined],
+		] as Array<[string, FixtureLink | undefined]>)),
+		[path.join(root, "private", ".auth.json.tmp-123"), fixtures.credentialDir], [path.join(root, "keyfiles", ".auth.json.tmp-123"), undefined],
 	];
-	for (const file of protectedFiles) {
-		it(`refuses read and direct grep of ${path.relative(root, file)}`, async () => {
+	for (const [file, prerequisite] of protectedFiles) {
+		it(`refuses read and direct grep of ${path.relative(root, file)}`, async (t) => {
+			if (prerequisite && !prerequisite.made) { t.skip("symlinks need extra rights on this machine"); return; }
 			await assert.rejects(readTool.execute!("s", { path: file }), denied);
 			await assert.rejects(grepTool.execute!("s", { path: file, pattern: "LH_SYNTHETIC_SECRET_MARKER" }), denied);
 		});
@@ -108,7 +121,8 @@ describe("source access: configured credentials only", () => {
 		assert.match(await text(lsTool, { path: home }), /\.ssh\//);
 	});
 
-	it("root-wide discovery omits credential targets, temp files, transcripts and dotenv contents", async () => {
+	it("root-wide discovery omits credential targets, temp files, transcripts and dotenv contents", async (t) => {
+		if (![fixtures.credentialDir, fixtures.auth, fixtures.transcripts].every((prerequisite) => prerequisite.made)) { t.skip("symlinks need extra rights on this machine"); return; }
 		assert.equal(await text(grepTool, { path: root, pattern: "LH_SYNTHETIC_SECRET_MARKER" }), "No matches found");
 		const found = await text(findTool, { path: root, pattern: "*" });
 		assert.match(found, /data\/chats\/session\.json/);
@@ -133,8 +147,9 @@ describe("source access: configured credentials only", () => {
 });
 
 describe("source access: canonical roots and all tool paths", () => {
-	for (const alias of [home, path.join(root, "home-alias"), path.join(root, "home-alias-2")]) {
-		it(`find/grep/walk cannot bypass denials through ${path.basename(alias)}`, async () => {
+	for (const [alias, prerequisite] of [[home, undefined], [path.join(root, "home-alias"), fixtures.homeAlias], [path.join(root, "home-alias-2"), fixtures.homeAlias2]] as Array<[string, FixtureLink | undefined]>) {
+		it(`find/grep/walk cannot bypass denials through ${path.basename(alias)}`, async (t) => {
+			if (prerequisite && !prerequisite.made) { t.skip("symlinks need extra rights on this machine"); return; }
 			const found = await text(findTool, { path: alias, pattern: "*" });
 			assert.match(found, /notes\/topic\.md/);
 			assert.doesNotMatch(found, /id_ed25519|session\.jsonl/);
@@ -146,8 +161,14 @@ describe("source access: canonical roots and all tool paths", () => {
 		});
 	}
 
-	it("denies a sensitive directory's real target outside home, not only its symlink name", async () => {
-		for (const folder of [path.join(home, ".claude"), path.join(root, "transcripts"), path.join(home, "notes", "keys")]) {
+	it("denies a sensitive directory's real target outside home, not only its symlink name", async (t) => {
+		const folders: Array<[string, FixtureLink]> = [
+			[path.join(home, ".claude"), fixtures.transcripts],
+			[path.join(root, "transcripts"), fixtures.transcripts],
+			[path.join(home, "notes", "keys"), fixtures.keys],
+		];
+		if (!folders.every(([, prerequisite]) => prerequisite.made)) { t.skip("symlinks need extra rights on this machine"); return; }
+		for (const [folder] of folders) {
 			await assert.rejects(lsTool.execute!("s", { path: folder }), denied);
 			await assert.rejects(findTool.execute!("s", { path: folder, pattern: "*" }), denied);
 			await assert.rejects(grepTool.execute!("s", { path: folder, pattern: "x" }), denied);
@@ -156,7 +177,8 @@ describe("source access: canonical roots and all tool paths", () => {
 		await assert.rejects(readTool.execute!("s", { path: path.join(root, "transcripts", "projects", "session.jsonl") }), denied);
 	});
 
-	it("canonicalizes an aliased HOME, including default and relative paths", async () => {
+	it("canonicalizes an aliased HOME, including default and relative paths", async (t) => {
+		if (!fixtures.homeAlias.made) { t.skip("symlinks need extra rights on this machine"); return; }
 		process.env.HOME = process.env.USERPROFILE = path.join(root, "home-alias");
 		try {
 			assert.equal(resolveSourcePath(), home);
@@ -167,10 +189,10 @@ describe("source access: canonical roots and all tool paths", () => {
 		} finally { process.env.HOME = process.env.USERPROFILE = home; }
 	});
 
-	it("a broken protected root does not disable ordinary reads, while source loops are never opened unchecked", async () => {
+	it("a broken protected root does not disable ordinary reads, while source loops are never opened unchecked", async (t) => {
 		const protectedLoop = path.join(home, ".gemini");
 		const ordinaryLoop = path.join(home, "notes", "loop");
-		await link(protectedLoop, protectedLoop, true);
+		if (!await link(protectedLoop, protectedLoop, true)) { t.skip("symlinks need extra rights on this machine"); return; }
 		await link(ordinaryLoop, ordinaryLoop, true);
 		try {
 			assert.match(await text(readTool, { path: "notes/topic.md" }), /ordinary study notes/);
@@ -182,9 +204,9 @@ describe("source access: canonical roots and all tool paths", () => {
 		}
 	});
 
-	it("uses the checked target for an ordinary file alias, and preserves missing-file errors", async () => {
+	it("uses the checked target for an ordinary file alias, and preserves missing-file errors", async (t) => {
 		const alias = path.join(home, "notes", "topic-alias");
-		await link(path.join(home, "notes", "topic.md"), alias);
+		if (!await link(path.join(home, "notes", "topic.md"), alias)) { t.skip("symlinks need extra rights on this machine"); return; }
 		assert.equal(resolveSourcePath(alias), path.join(home, "notes", "topic.md"));
 		assert.match(await text(readTool, { path: alias }), /ordinary study notes/);
 		await assert.rejects(readTool.execute!("s", { path: "notes/absent" }), /ENOENT/);
@@ -192,10 +214,10 @@ describe("source access: canonical roots and all tool paths", () => {
 	});
 
 	for (const name of [".env", ".env.example", ".env.template", ".ENV.production"]) {
-		it(`denies ${name} outside home, including through a differently named alias`, async () => {
+		it(`denies ${name} outside home, including through a differently named alias`, async (t) => {
 			const file = path.join(root, "elsewhere", name);
 			const alias = path.join(home, "notes", `alias-${name}`);
-			await link(file, alias);
+			if (!await link(file, alias)) { t.skip("symlinks need extra rights on this machine"); return; }
 			await assert.rejects(readTool.execute!("s", { path: file }), denied);
 			await assert.rejects(readTool.execute!("s", { path: alias }), denied);
 		});
@@ -223,7 +245,8 @@ describe("source access: canonical roots and all tool paths", () => {
 		await assert.rejects(readTool.execute!("s", { path: protectedImage }), denied);
 	});
 
-	it("PDF denial is a structured upfront failure before parsing, rendering or model calls", async () => {
+	it("PDF denial is a structured upfront failure before parsing, rendering or model calls", async (t) => {
+		if (!fixtures.transcripts.made) { t.skip("symlinks need extra rights on this machine"); return; }
 		const faux = createFauxCore({ tokenSize: { min: 64, max: 64 } });
 		let modelCalls = 0;
 		const engine = { model: faux.getModel(), streamFn: (() => { modelCalls++; throw new Error("must not call model"); }) as typeof faux.streamSimple };
@@ -268,7 +291,10 @@ describe("source access: case-sensitive home-location variants", () => {
 		await write("variant-vault/key", "CASE_VARIANT_SECRET\n");
 		await write("variant-cloud-vault/key", "CASE_VARIANT_SECRET\n");
 		await fs.rename(ssh, saved);
-		await link(vault, upperSsh, true);
+		if (!await link(vault, upperSsh, true)) {
+			await fs.rename(saved, ssh);
+			t.skip("symlinks need extra rights on this machine"); return;
+		}
 		await fs.mkdir(upperConfig);
 		await link(cloudVault, path.join(upperConfig, "GCLOUD"), true);
 		const native = realpathSync.native;
@@ -313,6 +339,7 @@ describe("source access: credential case aliases on the fixture filesystem", () 
 	}
 
 	it("refuses differently cased credential filenames, directories, real targets and temporary files", async (t) => {
+		if (![fixtures.credentialDir, fixtures.auth].every((prerequisite) => prerequisite.made)) { t.skip("symlinks need extra rights on this machine"); return; }
 		if (!await caseAliasesAvailable()) return t.skip("fixture filesystem is case-sensitive");
 		const aliases = [
 			path.join(root, "keyfiles", "CHATGPT-CREDENTIALS.JSON"),
@@ -340,6 +367,7 @@ describe("source access: credential case aliases on the fixture filesystem", () 
 	});
 
 	it("protects a non-symlink configured AUTH_FILE regardless of filename or parent-directory case", async (t) => {
+		if (!fixtures.auth.made) { t.skip("symlinks need extra rights on this machine"); return; }
 		if (!await caseAliasesAvailable()) return t.skip("fixture filesystem is case-sensitive");
 		await fs.unlink(auth);
 		await fs.writeFile(auth, "LH_SYNTHETIC_SECRET_MARKER\n");

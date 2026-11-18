@@ -49,7 +49,9 @@ function nativeCatalogFor(model: { provider: string; id: string }): ModelCatalog
 async function closed<T>(run: () => Promise<T>): Promise<T> {
 	const env = process.env;
 	const fetch = globalThis.fetch;
-	process.env = { NODE_ENV: "test", HOME: "/nonexistent/session-identity", OPENROUTER_API_KEY: "dummy-router", OPENCODE_API_KEY: "dummy-go", OPENAI_API_KEY: "dummy-openai" };
+	// Windows has no /tmp: os.tmpdir() needs TEMP (or TMP/TMPDIR) to stay sane.
+	const temps = Object.fromEntries(Object.entries({ TEMP: env.TEMP, TMP: env.TMP, TMPDIR: env.TMPDIR }).filter(([, value]) => value !== undefined));
+	process.env = { NODE_ENV: "test", HOME: "/nonexistent/session-identity", ...temps, OPENROUTER_API_KEY: "dummy-router", OPENCODE_API_KEY: "dummy-go", OPENAI_API_KEY: "dummy-openai" };
 	globalThis.fetch = async () => { throw new Error("CLOSED: unexpected fetch"); };
 	try { return await run(); } finally { process.env = env; globalThis.fetch = fetch; }
 }

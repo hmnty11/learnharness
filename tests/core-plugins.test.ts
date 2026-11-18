@@ -79,16 +79,18 @@ test("core provenance/configuration is captured, and replacing the core root wit
 	const ctx = await f.host.call("official", "context") as PluginBackendContext;
 	assert.equal(ctx.directory, code); assert.equal(ctx.dataDirectory, path.join(data, "official"));
 	assert.equal(f.host.list().find(p => p.id === "official")!.origin, "core");
-	const moved = path.join(f.root, "moved-code"); fs.renameSync(root, moved); fs.symlinkSync(moved, root);
+	const moved = path.join(f.root, "moved-code"); fs.renameSync(root, moved);
+	try { fs.symlinkSync(moved, root); }
+	catch { t.skip("symlinks need extra rights on this machine"); return; }
 	assert.throws(() => f.host.asset("official", ["main.js"]), /unsafe plugin asset/);
 });
 
 test("core data and package symlinks fail closed without writing their targets", async t => {
 	for (const kind of ["package", "data-root", "data-id"] as const) {
 		const f = fixture(t); const code = f.pkg("official", "core"); const outside = path.join(f.root, `outside-${kind}`); fs.mkdirSync(outside);
-		if (kind === "package") { fs.rmSync(code, { recursive: true }); fs.symlinkSync(outside, code); }
-		else if (kind === "data-root") { fs.mkdirSync(path.dirname(f.core.dataDirectory), { recursive: true }); fs.symlinkSync(outside, f.core.dataDirectory); }
-		else { fs.mkdirSync(f.core.dataDirectory, { recursive: true }); fs.symlinkSync(outside, path.join(f.core.dataDirectory, "official")); }
+		if (kind === "package") { fs.rmSync(code, { recursive: true }); try { fs.symlinkSync(outside, code); } catch { t.skip("symlinks need extra rights on this machine"); return; } }
+		else if (kind === "data-root") { fs.mkdirSync(path.dirname(f.core.dataDirectory), { recursive: true }); try { fs.symlinkSync(outside, f.core.dataDirectory); } catch { t.skip("symlinks need extra rights on this machine"); return; } }
+		else { fs.mkdirSync(f.core.dataDirectory, { recursive: true }); try { fs.symlinkSync(outside, path.join(f.core.dataDirectory, "official")); } catch { t.skip("symlinks need extra rights on this machine"); return; } }
 		await f.host.initialize(); await f.host.setEnabled("official", true);
 		assert.equal(f.host.list().find(p => p.id === "official")!.status, "error", kind);
 		assert.deepEqual(fs.readdirSync(outside), [], kind);
