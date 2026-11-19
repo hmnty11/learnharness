@@ -1,0 +1,106 @@
+From 63d486c9308b8d5470d621f1545aa90eb57601da Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Thu, 19 Nov 2026 11:41:38 +0800
+Subject: [PATCH 22/25] fix(sync): read OmniRoute models with object
+ capabilities metadata
+
+---
+ docs/custom-providers.md      |  2 +-
+ src/server/custom-provider.ts | 14 ++++++++++----
+ tests/custom-endpoint.test.ts | 16 ++++++++++++++--
+ 3 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/docs/custom-providers.md b/docs/custom-providers.md
+index 7c1c785..19a63ae 100644
+--- a/docs/custom-providers.md
++++ b/docs/custom-providers.md
+@@ -28,7 +28,7 @@ Edit each model's pins offline:
+ 
+ Positive integer token pins are accepted, including small output limits; blank removes a pin. The editor labels reported, fallback, and pinned values. **These are request/compaction budgets, not commands to resize the backend's context.** Configure the server separately and match its active limits. Reconnecting prunes pins only to the resulting model IDs.
+ 
+-Reasoning support declares a capability; it does not enable execution. The normal Pi effort picker remains available, but **Off may not disable a backend's default thinking**. There is no model-name inference, Ollama preset, thinking-map/compatibility editor, or nonstandard-header editor.
++Reasoning support declares a capability; it does not enable execution. The normal Pi effort picker remains available, but **Off may not disable a backend's default thinking**. There is no model-name inference, Ollama preset, thinking-map/compatibility editor, or nonstandard-header editor. Reported support is read from discovery metadata only: explicit booleans (`reasoning`/`supports_reasoning`/`thinking`), capability/parameter lists (vLLM, OpenRouter), and object-shaped capabilities (`{"reasoning": true, …}`, OmniRoute). Image capability is read from the same shapes ("vision"/"image" tokens or `vision: true`).
+ 
+ ## Images
+ 
+diff --git a/src/server/custom-provider.ts b/src/server/custom-provider.ts
+index 6d63b2e..97cba4e 100644
+--- a/src/server/custom-provider.ts
++++ b/src/server/custom-provider.ts
+@@ -178,7 +178,7 @@ function modelRows(body: unknown): unknown[] | null {
+  *  capability fields; absent or unrecognized → false (text-only). */
+ function detectImage(row: Record<string, unknown>): boolean {
+ 	const architecture = isRecord(row.architecture) ? row.architecture : undefined;
+-	const candidates = [
++	const candidates: unknown[] = [
+ 		architecture?.input_modalities,
+ 		row.input_modalities,
+ 		row.modalities,
+@@ -188,7 +188,9 @@ function detectImage(row: Record<string, unknown>): boolean {
+ 	for (const c of candidates) {
+ 		if (Array.isArray(c) && c.some((v) => typeof v === "string" && /image|vision/i.test(v))) return true;
+ 	}
+-	return false;
++	// OmniRoute-style object capabilities: {"vision": true, …}.
++	const caps = isRecord(row.capabilities) ? row.capabilities : undefined;
++	return caps?.vision === true;
+ }
+ 
+ /** Does a /models row advertise reasoning? Metadata only — no name guessing,
+@@ -202,12 +204,16 @@ function detectReasoning(row: Record<string, unknown>): boolean {
+ 		if (row[key] === true) return true;
+ 	}
+ 	const architecture = isRecord(row.architecture) ? row.architecture : undefined;
+-	const candidates = [row.supported_parameters, row.capabilities, row.tags, architecture?.output_modalities];
+-	return candidates.some(
++	const candidates: unknown[] = [row.supported_parameters, row.capabilities, row.tags, architecture?.output_modalities];
++	const listHit = candidates.some(
+ 		(list) =>
+ 			Array.isArray(list) &&
+ 			list.some((v) => typeof v === "string" && (/reasoning/i.test(v) || v.toLowerCase() === "thinking")),
+ 	);
++	if (listHit) return true;
++	// OmniRoute-style object capabilities: {"reasoning": true, "thinking": true, …}.
++	const caps = isRecord(row.capabilities) ? row.capabilities : undefined;
++	return Boolean(caps && (caps.reasoning === true || caps.supports_reasoning === true || caps.thinking === true));
+ }
+ 
+ /** First positive integer among `keys` on a row (endpoints name limits
+diff --git a/tests/custom-endpoint.test.ts b/tests/custom-endpoint.test.ts
+index 0441c17..98de23f 100644
+--- a/tests/custom-endpoint.test.ts
++++ b/tests/custom-endpoint.test.ts
+@@ -377,6 +377,8 @@ describe("discoverModels", () => {
+ 					{ id: "bool-reasoner", reasoning: true },
+ 					{ id: "thinking-flag", thinking: true },
+ 					{ id: "cap-reasoner", capabilities: ["completion", "reasoning"] },
++					{ id: "omni-object-caps", capabilities: { tool_calling: true, reasoning: true, thinking: true } },
++					{ id: "omni-object-vision", capabilities: { tool_calling: true, vision: true } },
+ 					{ id: "deepseek-r1-distill" }, // a reasoning-sounding NAME, no metadata → stays off
+ 				],
+ 			},
+@@ -386,9 +388,19 @@ describe("discoverModels", () => {
+ 		const byId = Object.fromEntries(r.models.map((m) => [m.id, Boolean(m.reasoning)]));
+ 		assert.equal(byId["vllm-reasoner"], true);
+ 		assert.equal(byId["bool-reasoner"], true);
+-		assert.equal(byId["thinking-flag"], true);
+ 		assert.equal(byId["cap-reasoner"], true);
+-		assert.equal(byId["deepseek-r1-distill"], false, "name guessing would risk sending reasoning_effort to a server that rejects it");
++		assert.equal(byId["omni-object-caps"], true, "OmniRoute publishes capabilities as an object, not a list");
++		assert.equal(byId["omni-object-vision"], false, "vision-only object capabilities do not declare reasoning");
++	});
++
++	it("detects image input from OmniRoute-style object capabilities", async () => {
++		stubFetch(() => ({
++			status: 200,
++			body: { data: [{ id: "img-from-object-caps", capabilities: { tool_calling: true, vision: true } }] },
++		}));
++		const r = await discoverModels("http://h/v1");
++		assert.ok(r.ok);
++		assert.equal(r.models[0]!.image, true);
+ 	});
+ 
+ 	it("guards the scheme before any fetch", async () => {
+-- 
+2.53.0.windows.1
+

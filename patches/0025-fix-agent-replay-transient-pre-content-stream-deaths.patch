@@ -1,0 +1,299 @@
+From 9dbbcab0a093fd713e7487b3fd2332dc217f1e12 Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Thu, 19 Nov 2026 15:18:42 +0800
+Subject: [PATCH 25/25] fix(agent): replay transient pre-content stream deaths
+
+- Upstream proxies (9router/OmniRoute, custom OpenAI-compatible endpoints) sometimes close the SSE connection before any content is produced; pi-ai surfaces "Stream ended without finish_reason".
+- piEngineForSpec's streamFn now replays such attempts with backoff (max 2, 1s/3s): nothing was shown or persisted, so a replay cannot duplicate transcript content.
+- Failures after visible content, non-transient errors, and aborts settle immediately; a dead attempt leaks no events (start held back until real content).
+- Custom routes re-resolve model metadata per attempt so a replay honours changed discovery.
+- Regression suite tests/stream-retry.test.ts drives a scripted provider through the real engine seam: recovery, budget exhaustion, non-transient, post-content, abort.
+---
+ src/agent/models.ts        | 119 +++++++++++++++++++++++++++++++++---
+ tests/stream-retry.test.ts | 121 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 232 insertions(+), 8 deletions(-)
+ create mode 100644 tests/stream-retry.test.ts
+
+diff --git a/src/agent/models.ts b/src/agent/models.ts
+index 12955eb..8df7905 100644
+--- a/src/agent/models.ts
++++ b/src/agent/models.ts
+@@ -3,12 +3,17 @@ import {
+ 	createModels,
+ 	getSupportedThinkingLevels,
+ 	type Api,
++	type AssistantMessage,
++	type AssistantMessageEvent,
+ 	type CacheRetention,
+ 	type Model,
+ 	type Models,
+ 	type MutableModels,
++	type SimpleStreamOptions,
+ 	type StreamFunction,
++	type TranscriptContext,
+ } from "@earendil-works/pi-ai";
++import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
+ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+ import { lazyApi, lazyStream } from "@earendil-works/pi-ai/api/lazy";
+ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+@@ -126,6 +131,97 @@ function defaultThinkingLevel(model: Model<Api>): ThinkingLevel {
+ 	return supported[0] ?? "off";
+ }
+ 
++
++/** Upstream proxies (9router/OmniRoute, custom OpenAI-compatible endpoints)
++ *  sometimes kill the SSE connection BEFORE any content is produced —
++ *  pi-ai surfaces that as "Stream ended without finish_reason". Nothing was
++ *  shown or persisted, so replaying the request cannot duplicate transcript
++ *  content. Anything else — a non-transient failure, an abort, or a failure
++ *  AFTER visible content — settles as-is: a mid-generation replay could
++ *  double-write the transcript. */
++const TRANSIENT_STREAM_RETRIES = 2;
++const TRANSIENT_STREAM_BACKOFF_MS = [1_000, 3_000] as const;
++const isTransientStreamError = (message: string | undefined): boolean =>
++	Boolean(message && /Stream ended without finish_reason|Stream ended before producing a non-ping SSE event/i.test(message));
++
++/** The zero-usage error AssistantMessage the other stream adapters build
++ *  (chatgpt-stream.ts `empty`, subscription-stream.ts) for failures. */
++function streamFailureMessage(model: Model<Api>, message: string, aborted: boolean): AssistantMessage {
++	return {
++		role: "assistant",
++		api: model.api,
++		provider: model.provider,
++		model: model.id,
++		content: [],
++		stopReason: aborted ? "aborted" : "error",
++		errorMessage: message,
++		timestamp: Date.now(),
++		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
++	};
++}
++
++/** Replay `open()` attempts that die before ANY visible content. An empty
++ *  `start` event is held back (a retried attempt emits its own) until the
++ *  first real event flushes it, so a dead attempt leaks nothing. */
++async function runTransientRetries(model: Model<Api>, open: () => AssistantMessageEventStream, out: AssistantMessageEventStream, signal: AbortSignal | undefined): Promise<void> {
++	for (let attempt = 0; ; attempt++) {
++		let heldStart: AssistantMessageEvent | undefined;
++		let forwarded = false;
++		try {
++			let replay = false;
++			for await (const event of open()) {
++				if (event.type === "start") {
++					heldStart = event; // not visible content: a retry replaces it
++					continue;
++				}
++				if (
++					event.type === "error" && !forwarded &&
++					isTransientStreamError(event.error.errorMessage) &&
++					attempt < TRANSIENT_STREAM_RETRIES && !signal?.aborted
++				) { replay = true; break; } // died before visible content
++				if (heldStart) { out.push(heldStart); heldStart = undefined; }
++				forwarded = true;
++				out.push(event);
++				if (event.type === "done" || event.type === "error") {
++					out.end(event.type === "done" ? event.message : event.error);
++					return;
++				}
++			}
++			if (!replay) {
++				// Source exhausted without a terminal event: whatever was
++				// forwarded stands; never fabricate a terminal.
++				if (heldStart) out.push(heldStart);
++				out.end();
++				return;
++			}
++		} catch (err) {
++			const message = err instanceof Error ? err.message : String(err);
++			if (forwarded || !isTransientStreamError(message) || attempt >= TRANSIENT_STREAM_RETRIES || signal?.aborted) {
++				// Thrown failures surface as a direct error event (legal before
++				// start per pi-ai's contract); the dead attempt's held start
++				// never escapes.
++				const failure = streamFailureMessage(model, message, signal?.aborted === true);
++				out.push({ type: "error", reason: failure.stopReason as "aborted" | "error", error: failure });
++				out.end(failure);
++				return;
++			}
++			// thrown transient before content: fall through to replay
++		}
++		const { promise, resolve } = Promise.withResolvers<void>();
++		setTimeout(resolve, TRANSIENT_STREAM_BACKOFF_MS[attempt]);
++		await promise;
++	}
++}
++
++/** Wrap ONE bound request: pre-content transient failures replay with
++ *  backoff; the consumer sees a single stream. */
++function withTransientStreamRetry(model: Model<Api>, open: () => AssistantMessageEventStream, signal: AbortSignal | undefined): AssistantMessageEventStream {
++	const out = new AssistantMessageEventStream();
++	void runTransientRetries(model, open, out, signal);
++	return out;
++}
++
++
+ /** The production engine for a RESOLVED spec (model slots wave,
+  *  2026-09-20): provider-aware catalog lookup + thinking clamp. The API
+  *  key is resolved by pi-ai itself from the environment per request (the
+@@ -172,17 +268,24 @@ export function piEngineForSpec(spec: ResolvedModelSpec, background: boolean | (
+ 				// tool-loop steps. Resolve thinking from the ORIGINAL preference (or
+ 				// existing default order), not a previous metadata snapshot's clamp.
+ 				// Pi retains the setup of an operation already in flight.
+-				const current = piModels();
+-				const currentModel = current.getModel(spec.provider, spec.id);
+-				if (!currentModel) return lazyStream(requestModel, async () => { throw new Error("The selected custom model is unavailable."); });
+-				const currentLevel = thinkingPreference
+-					? clampThinkingLevel(currentModel, thinkingPreference)
+-					: defaultThinkingLevel(currentModel);
+-				return current.streamSimple(permitImages(currentModel), context, { ...requestOptions, reasoning: currentLevel === "off" ? undefined : currentLevel });
++				return withTransientStreamRetry(requestModel, () => {
++					// Re-resolve the custom route per attempt, not per request:
++					// Pi retains setup of an operation in flight, but a replay
++					// RESTARTS the operation, so metadata may have changed.
++					const now = piModels();
++					const nowModel = now.getModel(spec.provider, spec.id);
++					if (!nowModel) {
++						return lazyStream(requestModel, async () => { throw new Error("The selected custom model is unavailable."); });
++					}
++					const nowLevel = thinkingPreference
++						? clampThinkingLevel(nowModel, thinkingPreference)
++						: defaultThinkingLevel(nowModel);
++					return now.streamSimple(permitImages(nowModel), context, { ...requestOptions, reasoning: nowLevel === "off" ? undefined : nowLevel });
++				}, options?.signal);
+ 			}
+ 			const purpose = typeof background === "function" ? background : () => background;
+ 			const stream = spec.provider === "chatgpt" ? chatGPTStream(purpose, lifecycle) : nativeId ? nativeSubscriptionStream(models.getProvider(nativeId)!, purpose, lifecycle) : models.streamSimple.bind(models);
+-			return stream(requestModel, context, requestOptions);
++			return withTransientStreamRetry(requestModel, () => stream(requestModel, context, requestOptions), options?.signal);
+ 		},
+ 	};
+ }
+diff --git a/tests/stream-retry.test.ts b/tests/stream-retry.test.ts
+new file mode 100644
+index 0000000..92569fd
+--- /dev/null
++++ b/tests/stream-retry.test.ts
+@@ -0,0 +1,121 @@
++import assert from "node:assert/strict";
++import { after, test } from "node:test";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { createProvider, fauxAssistantMessage, fauxText, normalizeContext, createFauxCore, type Api, type Model, type SimpleStreamOptions, type StreamFunction } from "@earendil-works/pi-ai";
++
++import { AssistantMessageEventStream, createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
++
++// All runtime/store imports follow isolation. No ambient auth, profiles,
++// models, data or network: scripted streams stop at the retry seam.
++const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lh-stream-retry-"));
++const originalEnv = process.env;
++process.env = { PATH: originalEnv.PATH, HOME: directory, NODE_ENV: "test", NODE_TEST_CONTEXT: originalEnv.NODE_TEST_CONTEXT, LH_DATA_DIR: directory, LH_AUTH_FILE: path.join(directory, "auth.json") };
++fs.writeFileSync(process.env.LH_AUTH_FILE!, "{}");
++const { piModels, piEngineForSpec, configureProviderSource } = await import("../src/agent/models.ts");
++after(() => { process.env = originalEnv; fs.rmSync(directory, { recursive: true, force: true }); });
++const context = normalizeContext({ systemPrompt: "stable", messages: [{ role: "user", content: "offline", timestamp: 1 }] });
++const PROVIDER_ID = "stream-retry-fixture";
++
++/** Insert a provider whose streamSimple plays a per-call script, returning
++ *  the call log so tests assert exact attempt and event counts. */
++function scriptedProvider(scripts: (string | AssistantMessageEventStream)[]): { calls: number } {
++	const state = { calls: 0 };
++	const faux = createFauxCore({});
++	const entry = { ...faux.getModel(), id: "fixture/model", provider: PROVIDER_ID } as unknown as Model<Api>;
++	const stream: StreamFunction = (model, ctx, options) => {
++		const script = scripts[Math.min(state.calls, scripts.length - 1)]!;
++		state.calls++;
++		if (typeof script === "string") return errorStream(script);
++		return script;
++	};
++	const provider = createProvider({ id: PROVIDER_ID, models: [entry], auth: { apiKey: { name: "fixture", resolve: async () => ({ auth: {} }) } }, api: { stream, streamSimple: stream } });
++	configureProviderSource({ isCustom: (id) => id === PROVIDER_ID, sync: (models) => { models.setProvider(provider); } });
++	return state;
++}
++
++/** A failure that dies before any content: exactly the pre-content death
++ *  the retry seam replays. */
++function errorStream(errorMessage: string): AssistantMessageEventStream {
++	const out = createAssistantMessageEventStream();
++	const failure = fauxAssistantMessage([], { stopReason: "error", errorMessage });
++	out.push({ type: "start", partial: failure });
++	out.push({ type: "error", reason: "error", error: failure });
++	out.end(failure);
++	return out;
++}
++
++/** A completed response with one text block — the post-retry success shape. */
++function successStream(): AssistantMessageEventStream {
++	const out = createAssistantMessageEventStream();
++	const message = fauxAssistantMessage([fauxText("recovered")], { stopReason: "stop" });
++	out.push({ type: "start", partial: message });
++	out.push({ type: "text_start", contentIndex: 0, partial: message });
++	out.push({ type: "text_delta", contentIndex: 0, delta: "recovered", partial: message });
++	out.push({ type: "text_end", contentIndex: 0, content: "recovered", partial: message });
++	out.push({ type: "done", reason: "stop", message });
++	out.end(message);
++	return out;
++}
++
++test("pre-content transient SSE death replays transparently and the retry succeeds", async () => {
++	const state = scriptedProvider(["Stream ended without finish_reason", successStream()]);
++	const engine = piEngineForSpec({ provider: PROVIDER_ID, id: "fixture/model" });
++	const result = await engine.streamFn(engine.model, context).result();
++	assert.equal(state.calls, 2, "one dead attempt, one recovery attempt");
++	assert.equal(result.stopReason, "stop");
++	assert.equal(result.errorMessage, undefined);
++	piModels().deleteProvider(PROVIDER_ID);
++});
++
++test("all attempts dying pre-content surfaces the raw error after the retry budget", async () => {
++	const state = scriptedProvider(["Stream ended without finish_reason"]);
++	const engine = piEngineForSpec({ provider: PROVIDER_ID, id: "fixture/model" });
++	const result = await engine.streamFn(engine.model, context).result();
++	// The failing event is forwarded as-is on the last attempt (no replays left).
++	assert.equal(state.calls, 3, "initial + 2 retries");
++	assert.equal(result.stopReason, "error");
++	assert.match(result.errorMessage ?? "", /Stream ended without finish_reason/);
++	piModels().deleteProvider(PROVIDER_ID);
++});
++
++test("non-transient failures never replay", async () => {
++	const state = scriptedProvider(["Provider returned an error stop reason"]);
++	const engine = piEngineForSpec({ provider: PROVIDER_ID, id: "fixture/model" });
++	const result = await engine.streamFn(engine.model, context).result();
++	assert.equal(state.calls, 1);
++	assert.equal(result.stopReason, "error");
++	piModels().deleteProvider(PROVIDER_ID);
++});
++
++test("a transient failure AFTER visible content never replays (no transcript double-write)", async () => {
++	class MidDeath extends AssistantMessageEventStream {
++		constructor() {
++			super();
++			const partial = fauxAssistantMessage([fauxText("partial")], { stopReason: "error", errorMessage: "Stream ended without finish_reason" });
++			this.push({ type: "start", partial });
++			this.push({ type: "text_start", contentIndex: 0, partial });
++			this.push({ type: "error", reason: "error", error: partial });
++			this.end(partial);
++		}
++	}
++	const state = scriptedProvider([new MidDeath(), successStream()]);
++	const engine = piEngineForSpec({ provider: PROVIDER_ID, id: "fixture/model" });
++	const result = await engine.streamFn(engine.model, context).result();
++	assert.equal(state.calls, 1, "content was already forwarded: no replay");
++	assert.equal(result.stopReason, "error");
++	piModels().deleteProvider(PROVIDER_ID);
++});
++
++test("abort stops retries", async () => {
++	const controller = new AbortController();
++	const state = scriptedProvider(["Stream ended without finish_reason"]);
++	const engine = piEngineForSpec({ provider: PROVIDER_ID, id: "fixture/model" });
++	controller.abort();
++	const result = await engine.streamFn(engine.model, context, { signal: controller.signal } as SimpleStreamOptions).result();
++	assert.ok(state.calls <= 1, "aborted signal prevents any replay: " + state.calls);
++	assert.equal(result.stopReason, "error");
++	assert.ok(state.calls === 0 || /abort/i.test(result.errorMessage ?? ""), "failure reflects the abort, not a silent replay loop");
++	piModels().deleteProvider(PROVIDER_ID);
++});
+-- 
+2.53.0.windows.1
+

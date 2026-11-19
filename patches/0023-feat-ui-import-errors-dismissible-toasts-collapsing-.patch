@@ -1,0 +1,221 @@
+From 4668fabd72b2afb53934ed06bdafc4f08b577235 Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Thu, 19 Nov 2026 13:42:44 +0800
+Subject: [PATCH 23/25] feat(ui): import errors dismissible toasts collapsing
+ duplicates
+
+- Show import failures as popups with a per-toast dismiss button.
+- Collapse identical error texts into the newest toast with a repeated-count label.
+- Auto-dismiss after 60 seconds and re-arm on a new import batch.
+---
+ components/graph-view.tsx          |  5 ++-
+ components/import-error-toasts.tsx | 65 ++++++++++++++++++++++++++++++
+ components/minimal-home.tsx        |  5 ++-
+ components/notes-import.tsx        |  3 --
+ tests/notes-import.test.tsx        | 35 +++++++++++-----
+ 5 files changed, 96 insertions(+), 17 deletions(-)
+ create mode 100644 components/import-error-toasts.tsx
+
+diff --git a/components/graph-view.tsx b/components/graph-view.tsx
+index 31281fe..5c6e391 100644
+--- a/components/graph-view.tsx
++++ b/components/graph-view.tsx
+@@ -64,7 +64,8 @@
+  */
+ 
+ import { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+-import { NotesImportControl, NotesImportErrors, NotesImportNotices, useNotesImport } from "@/components/notes-import.tsx";
++import { NotesImportControl, NotesImportNotices, useNotesImport } from "@/components/notes-import.tsx";
++import { ImportErrorToasts } from "@/components/import-error-toasts.tsx";
+ import { PluginGraphActions } from "@/components/plugin-chrome";
+ import { SettingsSlider as SettingSlider } from "@/components/settings/controls";
+ import Link from "next/link";
+@@ -1595,7 +1596,7 @@ export function GraphView({
+ 				/>
+ 			</div>
+ 
+-			<NotesImportErrors errors={notesImport.errors} />
++				<ImportErrorToasts errors={notesImport.errors} />
+ 			<NotesImportNotices notices={notesImport.notices} />
+ 			{/* Top-right tail (owner, 2026-09-20): the pipeline cost number —
+ 			    just a number, hover-highlighted, dropdown breakdown — then
+diff --git a/components/import-error-toasts.tsx b/components/import-error-toasts.tsx
+new file mode 100644
+index 0000000..150cc46
+--- /dev/null
++++ b/components/import-error-toasts.tsx
+@@ -0,0 +1,65 @@
++import { useEffect, useState } from "react";
++
++/**
++ * Import error toasts (owner-approved UX, 2026-11-19): the newest errors from
++ * user-triggered import/extract actions float as dismissible popups instead of
++ * a permanent inline banner. Identical error texts collapse — one toast with a
++ * "muncul error yang sama sebanyak N" counter replaces its duplicates.
++ * Distinct texts stay separate, each manually dismissible, and every toast
++ * disappears after 60 seconds of no interaction.
++ */
++const AUTO_DISMISS_MS = 60_000;
++
++interface Toast {
++	text: string;
++	sameCount: number;
++}
++
++/** Each distinct error text becomes one toast; identical texts collapse into
++ * their newest representative with a duplicate count. */
++const collapse = (errors: readonly string[]): Toast[] => {
++	const counts = new Map<string, number>();
++	for (const text of errors) counts.set(text, (counts.get(text) ?? 0) + 1);
++	return [...counts].map(([text, sameCount]) => ({ text, sameCount }));
++};
++
++export function ImportErrorToasts({ errors }: { errors: readonly string[] }) {
++	const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
++	const [visible, setVisible] = useState(true);
++	// The auto-dismiss timer resets whenever the error list changes — an
++	// arriving duplicate or new error means the user is still triggering work.
++	useEffect(() => {
++		if (errors.length === 0) return;
++		setVisible(true);
++		const timer = setTimeout(() => setVisible(false), AUTO_DISMISS_MS);
++		return () => clearTimeout(timer);
++	}, [errors]);
++	// A fresh import batch (errors reset to empty) re-arms dismissal so a new
++	// run's identical failures reappear instead of staying silently ignored.
++	useEffect(() => {
++		if (errors.length === 0) setDismissed(new Set());
++	}, [errors.length]);
++
++	const latest = collapse(errors).filter((t) => !dismissed.has(t.text));
++	if (!visible || latest.length === 0) return null;
++
++	return (
++		<div className="pointer-events-none absolute bottom-4 right-4 z-50 flex flex-col gap-2" data-testid="import-error-toasts">
++			{latest.map((toast) => (
++				<div key={toast.text} role="alert" data-testid="import-error-toast"
++					className="pointer-events-auto max-w-sm whitespace-pre-wrap break-words rounded-lg border border-error/40 bg-card px-3 py-2 text-xs text-error shadow-lg">
++					{toast.sameCount > 1 && (
++						<p className="mb-1 font-medium">{`muncul error yang sama sebanyak ${toast.sameCount}`}</p>
++					)}
++					<div className="flex items-start justify-between gap-2">
++						<span>{toast.text}</span>
++						<button type="button" aria-label="Dismiss error" onClick={() => setDismissed((prev) => new Set(prev).add(toast.text))}
++							className="ml-2 shrink-0 rounded px-1 text-muted-foreground hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1">
++							✕
++						</button>
++					</div>
++				</div>
++			))}
++		</div>
++	);
++}
+diff --git a/components/minimal-home.tsx b/components/minimal-home.tsx
+index b01ab19..0222374 100644
+--- a/components/minimal-home.tsx
++++ b/components/minimal-home.tsx
+@@ -22,7 +22,8 @@ import { useCallback, useEffect, useState } from "react";
+ import { ListTreeIcon } from "lucide-react";
+ import { ChainTableOverlay } from "@/components/chain-table.tsx";
+ import { GraphCostControl } from "@/components/graph-view.tsx";
+-import { NotesImportControl, NotesImportErrors, NotesImportNotices, useNotesImport } from "@/components/notes-import.tsx";
++import { NotesImportControl, NotesImportNotices, useNotesImport } from "@/components/notes-import.tsx";
++import { ImportErrorToasts } from "@/components/import-error-toasts.tsx";
+ import { Hint } from "@/components/ui/hint";
+ import type { ChatSummary, GraphCostSummary, GraphSnapshot } from "@/src/core";
+ 
+@@ -171,7 +172,7 @@ export function MinimalHome({
+ 					</div>
+ 					<NotesImportControl importing={importing} onImportFiles={onImportFiles} />
+ 				</div>
+-				<NotesImportErrors errors={notesImport.errors} />
++						<ImportErrorToasts errors={notesImport.errors} />
+ 				<NotesImportNotices notices={notesImport.notices} />
+ 				{costs && costs.runs.length > 0 && <GraphCostControl costs={costs} />}
+ 			</div>
+diff --git a/components/notes-import.tsx b/components/notes-import.tsx
+index 3a728e7..25a8a4d 100644
+--- a/components/notes-import.tsx
++++ b/components/notes-import.tsx
+@@ -127,9 +127,6 @@ export function NotesImportControl({ importing, onImportFiles }: { importing: bo
+ 	);
+ }
+ 
+-export function NotesImportErrors({ errors }: { errors: readonly string[] }) {
+-	return <>{errors.map((error, i) => <p key={i} role="alert" className="max-w-full whitespace-pre-wrap break-words text-xs text-error">{error}</p>)}</>;
+-}
+ export function NotesImportNotices({ notices }: { notices: readonly string[] }) {
+ 	return <>{notices.map((notice, i) => <p key={i} role="status" className="max-w-full whitespace-pre-wrap break-words text-xs text-muted-foreground">{notice}</p>)}</>;
+ }
+diff --git a/tests/notes-import.test.tsx b/tests/notes-import.test.tsx
+index 5bbae7e..ae3e245 100644
+--- a/tests/notes-import.test.tsx
++++ b/tests/notes-import.test.tsx
+@@ -8,8 +8,9 @@ import { parseHTML } from "linkedom";
+ import { InteractionLayersProvider } from "../components/interaction-layers.tsx";
+ import { installModalDom } from "./modal-dom.ts";
+ import { IMPORT_EXTENSIONS } from "../lib/notes-import-limits.ts";
+-import { MAX_IMPORT_BYTES, NotesImportControl, NotesImportErrors, NotesImportNotices, parseNotesImportResults, postNotesImport, useNotesImport, type NotesImportResult } from "../components/notes-import.tsx";
++import { MAX_IMPORT_BYTES, NotesImportControl, NotesImportNotices, parseNotesImportResults, postNotesImport, useNotesImport, type NotesImportResult } from "../components/notes-import.tsx";
+ 
++import { ImportErrorToasts } from "../components/import-error-toasts.tsx";
+ const dom = parseHTML("<html><body></body></html>");
+ Object.assign(globalThis, { window: dom.window, document: dom.document, HTMLElement: dom.window.HTMLElement, Element: dom.window.Element, IS_REACT_ACT_ENVIRONMENT: true });
+ const restoreModalDom = installModalDom(dom);
+@@ -23,7 +24,7 @@ async function mount() {
+ 	host = document.createElement("div"); document.body.appendChild(host); root = createRoot(host);
+ 	function Harness() {
+ 		current = useNotesImport({ onStart: () => { starts++; }, onFinish: () => { finishes++; } });
+-		return <NotesImportErrors errors={current.errors} />;
++		return <ImportErrorToasts errors={current.errors} />;
+ 	}
+ 	await act(async () => { root!.render(<Harness />); });
+ }
+@@ -76,11 +77,17 @@ for (const outcome of ["completed", "failed", "partial", "aborted", "busy"] as c
+ 	assert.equal(current.importing, false); assert.equal(starts, 1); assert.equal(finishes, 1);
+ 	assert.deepEqual(Object.keys(current).sort(), ["errors", "importing", "notices", "onImportFiles"]);
+ 	const html = host!.innerHTML;
+-	assert.doesNotMatch(html, /<button|<section|<ul|border|bg-card|rounded|shadow|Retry|Dismiss|Import complete/);
++	// Toasts are the popup chrome now: raw failure details must stay escaped
++	// text with no retry/import-complete controls; the dismiss button is
++	// the toast's own, deliberate control.
++	assert.doesNotMatch(html, /Retry|Import complete/);
+ 	if (outcome === "completed") { assert.equal(html, ""); assert.deepEqual(current.errors, []); }
+ 	else {
+ 		assert.deepEqual(current.errors, [`${file.name}: ${result.error}\nprovider_key_missing — openai — OPENAI_API_KEY — cheap, strong`]);
+-		assert.match(html, /&lt;script&gt;notes.md: &lt;img&gt;synthetic failure/); assert.match(html, /role="alert"/); assert.doesNotMatch(html, /<script>|<img>/);
++		assert.equal((host!.textContent ?? "").includes("synthetic failure"), true, "unescaped raw words readable as text");
++		assert.equal((host!.textContent ?? "").includes("provider_key_missing — openai — OPENAI_API_KEY — cheap, strong"), true, "details survive");
++		assert.match(html, /role="alert"/); assert.match(html, /Dismiss error/);
++		assert.doesNotMatch(html, /<script>|<img>/);
+ 	}
+ });
+ for (const details of [{ code: "models_not_configured", missing: ["cheap", "strong", "vision"] }, { code: "provider_key_missing", provider: "openai", slots: ["cheap"] }, { code: "provider_key_missing" }, {}]) it(`configuration details survive (${JSON.stringify(details)})`, async () => {
+@@ -185,10 +192,18 @@ it("busy graph action names extraction, and preserves the enabled queue picker",
+ 	assert.doesNotMatch(html, /Import notes|Importing…|disabled/);
+ });
+ 
+-it("alerts/notices stay plain and escaped", () => {
+-	assert.equal(renderToStaticMarkup(<NotesImportErrors errors={[]} />), "");
+-	const html = renderToStaticMarkup(<NotesImportErrors errors={["one.md: failure", "two.md: failure"]} />);
+-	assert.equal((html.match(/role="alert"/g) ?? []).length, 2); assert.doesNotMatch(html, /<section|<button|border|bg-/);
+-	const notices = renderToStaticMarkup(<NotesImportNotices notices={["a.pdf: Scanned pages may have errors."]} />);
+-	assert.match(notices, /role="status"/); assert.match(notices, /text-muted-foreground/); assert.doesNotMatch(notices, /text-red/);
++it("error toasts collapse duplicates and dismiss individually", async () => {
++	host = document.createElement("div"); document.body.appendChild(host); root = createRoot(host);
++	await act(async () => {
++		root!.render(<ImportErrorToasts errors={["a.md: failure", "a.md: failure", "b.md: other"]} />);
++	});
++	const html = host.innerHTML;
++	assert.equal((html.match(/role="alert"/g) ?? []).length, 2, "one toast per distinct text");
++	assert.match(html, /muncul error yang sama sebanyak 2/);
++	assert.doesNotMatch(html, /muncul error yang sama sebanyak 1/);
++	await act(async () => {
++		host!.querySelector<HTMLButtonElement>('[aria-label="Dismiss error"]')!.click();
++	});
++	assert.match(host.innerHTML, /b\.md: other/, "unrelated toast stays");
++	assert.doesNotMatch(host.innerHTML, /a\.md: failure/, "dismissed toast is gone");
+ });
+-- 
+2.53.0.windows.1
+

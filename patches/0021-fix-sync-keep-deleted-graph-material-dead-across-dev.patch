@@ -1,0 +1,1201 @@
+From 399d0acfd2b56905b239f6fa670ed462495c465f Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Thu, 19 Nov 2026 09:59:24 +0800
+Subject: [PATCH 21/25] fix(sync): keep deleted graph material dead across
+ devices
+
+- Record graph source and node deletions as manifest tombstones stamped at deletion time.
+- Merge tombstones last-write-wins and prune node, chain, coverage, source, position and placement entries before write-back.
+- Re-importing a deleted source after its tombstone survives and clears the tombstone.
+---
+ docs/architecture.md          |   2 +
+ src/core/sync-merge.ts        | 395 ++++++++++++++++++++++++++++++++--
+ src/server/chats.ts           |   4 +-
+ src/server/graph.ts           |   2 +
+ src/server/source-deletion.ts |   2 +
+ src/server/sync.ts            |  33 +++
+ tests/sync-merge.test.ts      | 335 ++++++++++++++++++++++++++++
+ tests/sync-service.test.ts    | 220 +++++++++++++++++++
+ 8 files changed, 980 insertions(+), 13 deletions(-)
+
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 42bc342..ca7ac18 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -159,6 +159,8 @@ Extraction is the construction writer, not the only mutation: source/session/nod
+ 
+ Adapters use synchronous filesystem operations. JSONL reads skip corrupt/invalid lines; graph derivation merges repeated assertions. Some replacements use temp-file rename, but ordinary whole-file writes are not database transactions. Same-event-loop serialization is not cross-process locking or crash atomicity. Use **one server owner per data/auth profile**.
+ 
++GitHub sync stores tombstones for chat, prompt, theme, graph-source, and graph-node deletions in the shared manifest, stamped when a deletion happens. Sync merges tombstones by newest timestamp and prunes deleted traces from every graph ledger and map before writing back, so a stale device cannot resurrect deleted graph material; a source re-imported after its deletion postdates the tombstone, survives, and clears it. Sync is single-owner, last-write-wins sharing, not multi-user concurrency control.
++
+ Chats and graph-family files have separate version guards; absent stamps read as v1, and newer versions are refused. Positions are rebuildable and unstamped. Settings have their own version/sanitization policy. Format counters are not app versions. Golden fixtures exercise compatibility. Graph-store initialization removes retired ledgers, so importing stores is not a universally read-only inspection method.
+ 
+ `/api/chats/:id/stream` is a turn/view stream. `/api/events` is a separate window-level notification stream: an ephemeral, process-local signal to fetch canonical data. [`SERVER_EVENT_TYPES`](../src/core/events.ts) is the event vocabulary. Consumers debounce and refetch on reconnect; notifications have no durable replay. A live turn's terminal controls settlement adoption so a notification fetch does not overwrite partial state. Settlement signals the end of work, not proof of a successful disk write.
+diff --git a/src/core/sync-merge.ts b/src/core/sync-merge.ts
+index 7ad25af..a50bf4a 100644
+--- a/src/core/sync-merge.ts
++++ b/src/core/sync-merge.ts
+@@ -12,6 +12,11 @@ export interface SyncManifest {
+ 	deletedChats: Record<string, string>;
+ 	deletedPrompts?: Record<string, string>;
+ 	deletedThemes?: Record<string, string>;
++	/** Graph deletion tombstones (sourceId → deletedAt): sources.json keys and
++	 *  every provenance chatId the source left in the graph ledgers. */
++	deletedGraphSources?: Record<string, string>;
++	/** Graph deletion tombstones (nodeId → deletedAt); `arg_` ids name chains. */
++	deletedGraphNodes?: Record<string, string>;
+ }
+ 
+ export interface SyncTextFile {
+@@ -265,6 +270,334 @@ function parseJsonObject(raw: string | undefined): Record<string, unknown> | nul
+ 	}
+ }
+ 
++/** Union two manifest tombstone maps, keeping the later deletedAt per key. */
++function mergeTombstoneMaps(
++	local: Record<string, string> | undefined,
++	remote: Record<string, string> | undefined,
++): Record<string, string> {
++	const merged: Record<string, string> = { ...(local ?? {}) };
++	for (const [id, ts] of Object.entries(remote ?? {})) {
++		const existing = merged[id];
++		if (!existing || compareIso(ts, existing) > 0) merged[id] = ts;
++	}
++	return merged;
++}
++
++type LedgerRecord = Record<string, unknown>;
++
++interface Point {
++	chatId: string;
++	messageId: string;
++}
++
++function parseLedgerObjects(raw: string): LedgerRecord[] {
++	const out: LedgerRecord[] = [];
++	for (const rawLine of raw.split(/\r?\n/)) {
++		const trimmed = rawLine.trim();
++		if (!trimmed) continue;
++		try {
++			const parsed: unknown = JSON.parse(trimmed);
++			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) out.push(parsed as LedgerRecord);
++		} catch {
++			// Corrupt line handled exactly like the pure union: skipped.
++		}
++	}
++	return out;
++}
++
++function recordString(rec: LedgerRecord, key: string): string | undefined {
++	const value = rec[key];
++	return typeof value === "string" ? value : undefined;
++}
++
++function pointsOf(value: unknown): Point[] {
++	if (!Array.isArray(value)) return [];
++	const out: Point[] = [];
++	for (const raw of value) {
++		if (!raw || typeof raw !== "object") continue;
++		const rec = raw as LedgerRecord;
++		if (typeof rec.chatId !== "string") continue;
++		out.push({ chatId: rec.chatId, messageId: typeof rec.messageId === "string" ? rec.messageId : "" });
++	}
++	return out;
++}
++
++function unionPoints(into: Point[], points: ReadonlyArray<Point>): void {
++	for (const pt of points) {
++		if (!into.some((q) => q.chatId === pt.chatId && q.messageId === pt.messageId)) into.push({ ...pt });
++	}
++}
++
++function unionStrings(into: string[], values: ReadonlyArray<unknown> | string): void {
++	const list = typeof values === "string" ? [values] : values;
++	for (const value of list) {
++		if (typeof value === "string" && value.length > 0 && !into.includes(value)) into.push(value);
++	}
++}
++
++function earliestIso(values: ReadonlyArray<string | undefined>): string | undefined {
++	let best: string | undefined;
++	for (const value of values) {
++		if (value === undefined || Number.isNaN(parseIso(value))) continue;
++		if (best === undefined || compareIso(value, best) < 0) best = value;
++	}
++	return best;
++}
++
++/** A tombstone is stale when the record was minted after the deletion —
++ *  the same resurrection rule chat tombstones use. */
++function resurrects(earliestCreatedAt: string | undefined, tombstone: string): boolean {
++	return earliestCreatedAt !== undefined && compareIso(earliestCreatedAt, tombstone) > 0;
++}
++
++function joinLedgerLines(records: ReadonlyArray<unknown>): string {
++	return records.length > 0 ? records.map((rec) => JSON.stringify(rec)).join("\n") + "\n" : "";
++}
++
++interface NodeLedgerReconciliation {
++	nodes: string;
++	/** Node ids whose every line is dead — chain members referencing them die. */
++	deadNodes: Set<string>;
++	deletedGraphNodes: Record<string, string>;
++}
++
++function reconcileNodeLedger(
++	raw: string,
++	deadSources: Record<string, string>,
++	tombstones: Record<string, string>,
++): NodeLedgerReconciliation {
++	const groups = new Map<string, LedgerRecord[]>();
++	// Emission slots preserve the union's line order: a group is emitted at its
++	// first occurrence, and identity-less records ride through in place.
++	const slots: Array<{ id?: string; rec?: LedgerRecord }> = [];
++	for (const rec of parseLedgerObjects(raw)) {
++		const id = recordString(rec, "id");
++		if (id === undefined) {
++			slots.push({ rec }); // not addressable as a node — foreign data
++			continue;
++		}
++		const group = groups.get(id);
++		if (group) group.push(rec);
++		else {
++			groups.set(id, [rec]);
++			slots.push({ id });
++		}
++	}
++
++	const deletedGraphNodes: Record<string, string> = { ...tombstones };
++	const deadNodes = new Set<string>();
++	const out: LedgerRecord[] = [];
++	const isDeadSource = (pt: Point): boolean => Object.hasOwn(deadSources, pt.chatId);
++
++	for (const slot of slots) {
++		if (slot.rec) {
++			out.push(slot.rec);
++			continue;
++		}
++		const id = slot.id!;
++		const records = groups.get(id)!;
++		const tombstone = deletedGraphNodes[id];
++		if (tombstone) {
++			const earliest = earliestIso(records.map((rec) => recordString(rec, "createdAt")));
++			if (!resurrects(earliest, tombstone)) {
++				deadNodes.add(id); // ALL lines die with an active tombstone
++				continue;
++			}
++			delete deletedGraphNodes[id]; // re-created after deletion — the node lives
++		}
++
++		const touched = records.some((rec) => pointsOf(rec.provenance).some(isDeadSource));
++		if (!touched) {
++			// Outside this deletion's blast radius (incl. legacy provenance-free).
++			out.push(...records);
++			continue;
++		}
++
++		const cleaned = records.map((rec) => ({
++			rec,
++			original: pointsOf(rec.provenance),
++			points: pointsOf(rec.provenance).filter((pt) => !isDeadSource(pt)),
++		}));
++		// The create line is the EARLIEST line (a link line shares the id but
++		// was minted later); it owns the node's identity.
++		let createIndex = 0;
++		for (let i = 1; i < cleaned.length; i += 1) {
++			const candidate = cleaned[i]!;
++			const incumbent = cleaned[createIndex]!;
++			const candidateAt = recordString(candidate.rec, "createdAt");
++			const incumbentAt = recordString(incumbent.rec, "createdAt");
++			if (candidateAt !== undefined && (incumbentAt === undefined || compareIso(candidateAt, incumbentAt) < 0)) {
++				createIndex = i;
++			}
++		}
++		const create = cleaned[createIndex]!;
++
++		if (!cleaned.some((line) => line.points.length > 0)) {
++			// No provenance survived. Legacy provenance-free lines are foreign
++			// data and ride untouched; a node whose every line carried the
++			// deleted source's points dies with them.
++			const survivors = cleaned.filter((line) => line.original.length === 0).map((line) => line.rec);
++			if (survivors.length === 0) deadNodes.add(id);
++			else out.push(...survivors);
++			continue;
++		}
++
++		// Reconcile into ONE canonical line: identity from the create line,
++		// provenance/aliases from the surviving lines. Link lines whose points
++		// all died collapse away with their phrasings.
++		const aliases: string[] = [];
++		const provenance: Point[] = [];
++		const ownsPhrasings = (line: (typeof cleaned)[number]): boolean => line.points.length > 0;
++		if (ownsPhrasings(create)) {
++			unionPoints(provenance, create.points);
++			unionStrings(aliases, Array.isArray(create.rec.aliases) ? (create.rec.aliases as unknown[]) : []);
++		}
++		cleaned.forEach((line, index) => {
++			if (index === createIndex || !ownsPhrasings(line)) return;
++			unionPoints(provenance, line.points);
++			unionStrings(aliases, recordString(line.rec, "statement") ?? []);
++			unionStrings(aliases, Array.isArray(line.rec.aliases) ? (line.rec.aliases as unknown[]) : []);
++		});
++		out.push({
++			...create.rec,
++			name: recordString(create.rec, "name") ?? "",
++			statement: recordString(create.rec, "statement") ?? "",
++			createdAt: recordString(create.rec, "createdAt") ?? "",
++			aliases,
++			provenance,
++		});
++	}
++
++	// Tombstones with no surviving lines still name dead ids for chains/positions.
++	for (const id of Object.keys(deletedGraphNodes)) deadNodes.add(id);
++
++	return { nodes: joinLedgerLines(out), deadNodes, deletedGraphNodes };
++}
++
++interface ChainLedgerReconciliation {
++	chains: string;
++	deadChains: Set<string>;
++	deletedGraphNodes: Record<string, string>;
++}
++
++function reconcileChainLedger(
++	raw: string,
++	deadSources: Record<string, string>,
++	deadNodes: ReadonlySet<string>,
++	tombstones: Record<string, string>,
++): ChainLedgerReconciliation {
++	const deletedGraphNodes: Record<string, string> = { ...tombstones };
++	const deadChains = new Set<string>();
++	const out: LedgerRecord[] = [];
++	const isDeadSource = (pt: Point): boolean => Object.hasOwn(deadSources, pt.chatId);
++
++	const records = parseLedgerObjects(raw);
++	// Chain-level tombstones (an arg_ id names a chain assertion).
++	const tombstonedIds = new Set(records.map((rec) => recordString(rec, "id")).filter((id): id is string => id !== undefined));
++	for (const id of tombstonedIds) {
++		const tombstone = deletedGraphNodes[id];
++		if (tombstone === undefined) continue;
++		const earliest = earliestIso(
++			records.filter((rec) => recordString(rec, "id") === id).map((rec) => recordString(rec, "createdAt")),
++		);
++		if (resurrects(earliest, tombstone)) delete deletedGraphNodes[id];
++	}
++
++	const deadNodeId = (value: unknown): boolean => typeof value === "string" && deadNodes.has(value);
++
++	for (const rec of records) {
++		const id = recordString(rec, "id");
++		if (id !== undefined && deletedGraphNodes[id] !== undefined) {
++			deadChains.add(id);
++			continue;
++		}
++		const premises = Array.isArray(rec.premises) ? rec.premises : [];
++		const conclusion = recordString(rec, "conclusion");
++		if (conclusion === undefined || premises.some(deadNodeId) || deadNodes.has(conclusion)) {
++			if (id !== undefined) deadChains.add(id);
++			continue; // a chain with a dead member is not a chain
++		}
++		const original = pointsOf(rec.provenance);
++		const points = original.filter((pt) => !isDeadSource(pt));
++		if (original.length > 0 && points.length === 0) {
++			if (id !== undefined) deadChains.add(id);
++			continue; // THIS deletion emptied the assertion's provenance
++		}
++		out.push(points.length === original.length ? rec : { ...rec, provenance: points });
++	}
++
++	// Every remaining tombstone names a chain id (node ids are equally dead), so
++	// its position key is pruned even when no line of it survived the union.
++	for (const id of Object.keys(deletedGraphNodes)) deadChains.add(id);
++
++	return { chains: joinLedgerLines(out), deadChains, deletedGraphNodes };
++}
++
++/** Drop ledger rows whose chatId was deleted (chat or graph-source tombstone). */
++function filterLedgerByChatId(raw: string, deadChatIds: ReadonlySet<string>): string {
++	const kept = parseLedgerObjects(raw).filter((rec) => {
++		const chatId = recordString(rec, "chatId");
++		return chatId === undefined || !deadChatIds.has(chatId);
++	});
++	return joinLedgerLines(kept);
++}
++
++/** Drop sources tombstoned for deletion; a re-import newer than the tombstone
++ * resurrects its entry and clears the tombstone (mirrors chat resurrection). */
++function pruneSourcesJson(
++	sourcesRaw: string | undefined,
++	tombstones: Record<string, string>,
++): { sources: string | undefined; tombstones: Record<string, string> } {
++	const obj = parseJsonObject(sourcesRaw);
++	if (!obj) return { sources: sourcesRaw, tombstones };
++	let changed = false;
++	for (const id of Object.keys(tombstones)) {
++		if (!Object.hasOwn(obj, id)) continue;
++		const entry = obj[id];
++		const importedAt =
++			entry && typeof entry === "object" ? recordString(entry as LedgerRecord, "importedAt") : undefined;
++		if (importedAt !== undefined && compareIso(importedAt, tombstones[id]!) > 0) {
++			delete tombstones[id]; // imported again after the deletion — resurrected
++			continue;
++		}
++		delete obj[id];
++		changed = true;
++	}
++	return { sources: changed ? JSON.stringify(obj, null, "\t") : sourcesRaw, tombstones };
++}
++
++/** Drop graph ids that died in this merge; untouched when nothing dies. */
++function prunePositionsJson(positionsRaw: string | undefined, deadIds: ReadonlySet<string>): string | undefined {
++	const parsed = parsePositionsMap(positionsRaw);
++	if (!parsed) return positionsRaw;
++	let changed = false;
++	for (const id of deadIds) {
++		if (!Object.hasOwn(parsed.positions, id)) continue;
++		delete parsed.positions[id];
++		changed = true;
++	}
++	return changed ? JSON.stringify({ positions: parsed.positions, updatedAt: parsed.updatedAt }, null, "\t") : positionsRaw;
++}
++
++/** Drop folder placements for tombstoned sources; other organization data stays
++ * verbatim so a merge cannot reorder or reformat folders the user arranged. */
++function pruneSourceOrganizationJson(
++	organizationRaw: string | undefined,
++	tombstones: Record<string, string>,
++): string | undefined {
++	const obj = parseJsonObject(organizationRaw);
++	if (!obj) return organizationRaw;
++	const placements = obj.placements;
++	if (!placements || typeof placements !== "object" || Array.isArray(placements)) return organizationRaw;
++	let changed = false;
++	for (const id of Object.keys(tombstones)) {
++		if (!Object.hasOwn(placements, id)) continue;
++		delete (placements as Record<string, unknown>)[id];
++		changed = true;
++	}
++	return changed ? JSON.stringify(obj, null, "\t") : organizationRaw;
++}
++
+ function mergeSourcesJson(localSourcesRaw?: string, remoteSourcesRaw?: string): string | undefined {
+ 	const localObj = parseJsonObject(localSourcesRaw);
+ 	const remoteObj = parseJsonObject(remoteSourcesRaw);
+@@ -365,22 +698,58 @@ export function mergeSyncSnapshots(
+ 		remote.manifest.deletedThemes ?? {},
+ 	);
+ 
+-	const nodes = mergeJsonlLedger(local.graphLedgers.nodes ?? "", remote.graphLedgers.nodes ?? "");
+-	const chains = mergeJsonlLedger(local.graphLedgers.chains ?? "", remote.graphLedgers.chains ?? "");
+-	const sessions = mergeJsonlLedger(local.graphLedgers.sessions ?? "", remote.graphLedgers.sessions ?? "");
+-	const coverage = mergeJsonlLedger(local.graphLedgers.coverage ?? "", remote.graphLedgers.coverage ?? "");
+-
+-	const sources = mergeSourcesJson(local.graphFiles?.sources, remote.graphFiles?.sources);
+-	const positions = mergePositionsJson(
+-		local.graphFiles?.positions,
+-		remote.graphFiles?.positions,
+-		local.manifest.updatedAt,
+-		remote.manifest.updatedAt,
++	// Deletions travel as manifest tombstones: a stale peer's copy of a deleted
++	// graph source or node must not be resurrected by the union below. Sources
++	// are pruned FIRST — a re-import newer than its tombstone clears the
++	// tombstone, which in turn keeps that source's nodes and coverage alive.
++	const sourcePrune = pruneSourcesJson(
++		mergeSourcesJson(local.graphFiles?.sources, remote.graphFiles?.sources),
++		mergeTombstoneMaps(local.manifest.deletedGraphSources, remote.manifest.deletedGraphSources),
++	);
++	const sources = sourcePrune.sources;
++	const deletedGraphSources = sourcePrune.tombstones;
++
++	const nodeResult = reconcileNodeLedger(
++		mergeJsonlLedger(local.graphLedgers.nodes ?? "", remote.graphLedgers.nodes ?? ""),
++		deletedGraphSources,
++		mergeTombstoneMaps(local.manifest.deletedGraphNodes, remote.manifest.deletedGraphNodes),
++	);
++	const chainResult = reconcileChainLedger(
++		mergeJsonlLedger(local.graphLedgers.chains ?? "", remote.graphLedgers.chains ?? ""),
++		deletedGraphSources,
++		nodeResult.deadNodes,
++		nodeResult.deletedGraphNodes,
++	);
++	const nodes = nodeResult.nodes;
++	const chains = chainResult.chains;
++	const deletedGraphNodes = chainResult.deletedGraphNodes;
++
++	// Coverage rows and session checkpoints key off chatId, which is also the
++	// graph-source id, so chat deletion and graph deletion both suppress them.
++	const deadLedgerChatIds = new Set([...Object.keys(chatMerge.deletedChats), ...Object.keys(deletedGraphSources)]);
++	const sessions = filterLedgerByChatId(
++		mergeJsonlLedger(local.graphLedgers.sessions ?? "", remote.graphLedgers.sessions ?? ""),
++		deadLedgerChatIds,
++	);
++	const coverage = filterLedgerByChatId(
++		mergeJsonlLedger(local.graphLedgers.coverage ?? "", remote.graphLedgers.coverage ?? ""),
++		deadLedgerChatIds,
++	);
++
++	const positions = prunePositionsJson(
++		mergePositionsJson(
++			local.graphFiles?.positions,
++			remote.graphFiles?.positions,
++			local.manifest.updatedAt,
++			remote.manifest.updatedAt,
++		),
++		new Set([...nodeResult.deadNodes, ...chainResult.deadChains]),
+ 	);
+ 
+-	const sourceOrganization = remoteManifestNewer
++	const mergedOrganization = remoteManifestNewer
+ 		? (remote.graphFiles?.sourceOrganization ?? local.graphFiles?.sourceOrganization)
+ 		: (local.graphFiles?.sourceOrganization ?? remote.graphFiles?.sourceOrganization);
++	const sourceOrganization = pruneSourceOrganizationJson(mergedOrganization, deletedGraphSources);
+ 
+ 	const renderSettings = remoteManifestNewer
+ 		? (remote.graphFiles?.renderSettings ?? local.graphFiles?.renderSettings)
+@@ -407,6 +776,8 @@ export function mergeSyncSnapshots(
+ 			deletedChats: chatMerge.deletedChats,
+ 			deletedPrompts: promptMerge.deleted,
+ 			deletedThemes: themeMerge.deleted,
++			...(Object.keys(deletedGraphSources).length > 0 ? { deletedGraphSources } : {}),
++			...(Object.keys(deletedGraphNodes).length > 0 ? { deletedGraphNodes } : {}),
+ 		},
+ 		chats: chatMerge.chats,
+ 		graphLedgers: { nodes, chains, sessions, coverage },
+diff --git a/src/server/chats.ts b/src/server/chats.ts
+index 161fa7d..674166e 100644
+--- a/src/server/chats.ts
++++ b/src/server/chats.ts
+@@ -9,7 +9,7 @@ import { isTurnRunning } from "./turn-liveness.ts";
+ import { clearTurnFailure } from "./turn-runs.ts";
+ import { discardChatDeliveries } from "./jobs.ts";
+ import { sideChats } from "./side-chat.ts";
+-import { recordChatDeleted } from "./sync.ts";
++import { recordChatDeleted, recordGraphSourceDeleted } from "./sync.ts";
+ 
+ /**
+  * Server-side chat entries for the transport layer (app/api/chats*,
+@@ -145,6 +145,8 @@ function finishChatDeletion(chatId: string, mode: ChatDeleteMode): Extract<ChatD
+ 	// THE SYNC BLOCK — no awaits below (see the doc comment). Order:
+ 	// ledgers → jobs → the chat record.
+ 	const stats = deleteChatTraces(stores.graphStore, chatId, mode);
++	// Preserve-graph keeps the nodes, so only the full purge tombstones the source.
++	if (mode === "delete-nodes") recordGraphSourceDeleted(chatId);
+ 	const jobsRemoved = finishChatRecordDeletion(chatId);
+ 	return { ok: true, mode, stats, jobsRemoved, graphRevision: graphRevision() };
+ }
+diff --git a/src/server/graph.ts b/src/server/graph.ts
+index 82dc30e..d35e4c3 100644
+--- a/src/server/graph.ts
++++ b/src/server/graph.ts
+@@ -12,6 +12,7 @@ import {
+ import { extractionStatuses } from "../agent/subagents/extraction.ts";
+ import { stores } from "./stores.ts";
+ import { callCost } from "./pricing.ts";
++import { recordGraphNodeDeleted } from "./sync.ts";
+ 
+ /**
+  * Server-side graph entry for the home view (GET /api/graph). A PURE READ:
+@@ -118,6 +119,7 @@ export function deleteGraphNode(nodeId: string): NodeDeleteOutcome {
+ 	if (stats === null) {
+ 		return { ok: false, status: 404, code: "not_found", error: "No such node" };
+ 	}
++	recordGraphNodeDeleted(nodeId);
+ 	return { ok: true, stats, graphRevision: graphRevision() };
+ }
+ 
+diff --git a/src/server/source-deletion.ts b/src/server/source-deletion.ts
+index 8dbd289..27f37f0 100644
+--- a/src/server/source-deletion.ts
++++ b/src/server/source-deletion.ts
+@@ -5,6 +5,7 @@ import { stores } from "./stores.ts";
+ import { sourceDirectory } from "./source-organization.ts";
+ import { deleteIdleChatRecord, runningWorkBlocker } from "./chats.ts";
+ import { graphRevision } from "./graph.ts";
++import { recordGraphSourceDeleted } from "./sync.ts";
+ 
+ export class SourceDeletionError extends Error {
+ 	constructor(message: string, public status = 400, public code = "invalid_source_deletion") { super(message); }
+@@ -39,6 +40,7 @@ export function deleteSources(raw: unknown): SourceDirectory & { graphRevision:
+ 	// coverage/checkpoints too, so their unchanged messages can be re-extracted.
+ 	deleteSourcesTraces(stores.graphStore, new Set(targets.map((s) => s.id)), "delete-nodes");
+ 	stores.graphStore.deleteSources(new Set(targets.filter((s) => s.kind === "notes").map((s) => s.id)));
++	for (const id of request.sourceIds) recordGraphSourceDeleted(id);
+ 	const removed = new Set(request.sourceIds.filter((id) => !directory.sources.some((s) => s.id === id)));
+ 	for (const entry of targets) {
+ 		if (entry.kind === "chat" && request.deleteSessions) {
+diff --git a/src/server/sync.ts b/src/server/sync.ts
+index 743c7ad..b547616 100644
+--- a/src/server/sync.ts
++++ b/src/server/sync.ts
+@@ -48,6 +48,8 @@ interface LocalSyncConfig {
+ 	deletedChats: Record<string, string>;
+ 	deletedPrompts: Record<string, string>;
+ 	deletedThemes: Record<string, string>;
++	deletedGraphSources: Record<string, string>;
++	deletedGraphNodes: Record<string, string>;
+ }
+ 
+ interface LocalSyncSecrets {
+@@ -178,6 +180,8 @@ function defaultSyncConfig(): LocalSyncConfig {
+ 		deletedChats: {},
+ 		deletedPrompts: {},
+ 		deletedThemes: {},
++		deletedGraphSources: {},
++		deletedGraphNodes: {},
+ 	};
+ }
+ 
+@@ -204,6 +208,8 @@ function readSyncConfig(dataDir: string): LocalSyncConfig {
+ 			deletedChats: toStringRecord(raw.deletedChats),
+ 			deletedPrompts: toStringRecord(raw.deletedPrompts),
+ 			deletedThemes: toStringRecord(raw.deletedThemes),
++			deletedGraphSources: toStringRecord(raw.deletedGraphSources),
++			deletedGraphNodes: toStringRecord(raw.deletedGraphNodes),
+ 		};
+ 	} catch {
+ 		return defaultSyncConfig();
+@@ -250,6 +256,27 @@ export function recordChatDeleted(chatId: string, dataDir: string = PATHS.data):
+ 	writeSyncConfig(dataDir, config);
+ }
+ 
++/** Record a graph-source deletion (the sourceId is also the chatId its
++ *  provenance points carry) so a stale peer cannot union the old rows back. */
++export function recordGraphSourceDeleted(sourceId: string, dataDir: string = PATHS.data): void {
++	if (!sourceId) return;
++	const config = readSyncConfig(dataDir);
++	const iso = new Date().toISOString();
++	const prev = config.deletedGraphSources[sourceId];
++	config.deletedGraphSources[sourceId] = prev && prev > iso ? prev : iso;
++	writeSyncConfig(dataDir, config);
++}
++
++/** Record a graph-node deletion; `arg_` ids name chains. */
++export function recordGraphNodeDeleted(nodeId: string, dataDir: string = PATHS.data): void {
++	if (!nodeId) return;
++	const config = readSyncConfig(dataDir);
++	const iso = new Date().toISOString();
++	const prev = config.deletedGraphNodes[nodeId];
++	config.deletedGraphNodes[nodeId] = prev && prev > iso ? prev : iso;
++	writeSyncConfig(dataDir, config);
++}
++
+ export function recordPromptDeleted(relPath: string, dataDir: string = PATHS.data): void {
+ 	if (!relPath) return;
+ 	const config = readSyncConfig(dataDir);
+@@ -550,6 +577,8 @@ function readLocalSnapshot(dataDir: string, config: LocalSyncConfig): SyncSnapsh
+ 			deletedChats: { ...config.deletedChats },
+ 			deletedPrompts: { ...config.deletedPrompts },
+ 			deletedThemes: { ...config.deletedThemes },
++			deletedGraphSources: { ...config.deletedGraphSources },
++			deletedGraphNodes: { ...config.deletedGraphNodes },
+ 		},
+ 		chats: readLocalChats(dataDir),
+ 		graphLedgers: {
+@@ -750,6 +779,8 @@ function deserializeRemoteSnapshot(files: Record<string, string>): SyncSnapshot
+ 		deletedChats: toStringMap(rawManifest.deletedChats),
+ 		deletedPrompts: toStringMap(rawManifest.deletedPrompts),
+ 		deletedThemes: toStringMap(rawManifest.deletedThemes),
++		deletedGraphSources: toStringMap(rawManifest.deletedGraphSources),
++		deletedGraphNodes: toStringMap(rawManifest.deletedGraphNodes),
+ 	};
+ 
+ 	let meta: SyncMeta = {};
+@@ -1028,6 +1059,8 @@ export function createSyncService(options: CreateSyncServiceOptions = {}): SyncS
+ 				deletedChats: mergedSnapshot.manifest.deletedChats,
+ 				deletedPrompts: mergedSnapshot.manifest.deletedPrompts ?? {},
+ 				deletedThemes: mergedSnapshot.manifest.deletedThemes ?? {},
++			deletedGraphSources: mergedSnapshot.manifest.deletedGraphSources ?? {},
++			deletedGraphNodes: mergedSnapshot.manifest.deletedGraphNodes ?? {},
+ 			};
+ 			writeSyncConfig(dataDir, updatedConfig);
+ 
+diff --git a/tests/sync-merge.test.ts b/tests/sync-merge.test.ts
+index bd5001a..5610782 100644
+--- a/tests/sync-merge.test.ts
++++ b/tests/sync-merge.test.ts
+@@ -7,6 +7,8 @@ import {
+ 	mergeTextFileMap,
+ 	mergeSyncSnapshots,
+ 	type ChatRecord,
++	type GraphChain,
++	type GraphNode,
+ 	type LhMessage,
+ 	type SyncSnapshot,
+ 	type SyncTextFile,
+@@ -383,3 +385,336 @@ describe("mergeSyncSnapshots", () => {
+ 		assert.equal(merged.themes["custom.json"]?.content, '{"name":"Remote"}');
+ 	});
+ });
++
++// ─── Graph deletion tombstones (design: local://graph-sync-tombstone-design.md) ───
++
++function linesOf<T>(raw: string): T[] {
++	return raw
++		.split(/\r?\n/)
++		.map((line) => line.trim())
++		.filter((line) => line.length > 0)
++		.map((line) => JSON.parse(line) as T);
++}
++
++function nodeLine(over: Partial<GraphNode> & { id: string }): GraphNode {
++	return {
++		name: over.id,
++		statement: `Statement of ${over.id}`,
++		aliases: [],
++		createdAt: "2026-11-10T08:00:00.000Z",
++		provenance: [],
++		...over,
++	};
++}
++
++function chainLine(over: Partial<GraphChain> & { id: string; premises: string[]; conclusion: string }): GraphChain {
++	return {
++		createdAt: "2026-11-10T08:00:00.000Z",
++		provenance: [],
++		...over,
++	};
++}
++
++const jsonl = (...rows: unknown[]): string => rows.map((row) => JSON.stringify(row) + "\n").join("");
++
++describe("mergeSyncSnapshots graph tombstones", () => {
++	it("suppresses a deleted source's nodes and prunes sources, positions, and organization", () => {
++		const deadSource = "src_dead";
++		const node = nodeLine({
++			id: "n_dead",
++			provenance: [{ chatId: deadSource, messageId: "" }],
++		});
++		const local = makeSnapshot({
++			manifest: {
++				version: 1,
++				owner: "hmnty11",
++				updatedAt: "2026-11-10T12:00:00.000Z",
++				deletedChats: {},
++				deletedGraphSources: { [deadSource]: "2026-11-10T11:00:00.000Z" },
++			},
++			graphLedgers: { nodes: "", chains: "", sessions: "", coverage: "" },
++			graphFiles: {
++				sources: JSON.stringify({
++					[deadSource]: { id: deadSource, filePath: "notes/dead.md", importedAt: "2026-11-10T09:00:00.000Z" },
++				}),
++				positions: JSON.stringify({ positions: { n_dead: { x: 1, y: 2 } }, updatedAt: "2026-11-10T12:00:00.000Z" }),
++				sourceOrganization: JSON.stringify({
++					version: 1,
++					folders: [],
++					placements: { [deadSource]: { folderId: null } },
++				}),
++			},
++		});
++		// Stale remote: still carries the deleted source's graph content.
++		const remote = makeSnapshot({
++			manifest: {
++				version: 1,
++				owner: "hmnty11",
++				updatedAt: "2026-11-10T13:00:00.000Z",
++				deletedChats: {},
++				deletedGraphSources: { [deadSource]: "2026-11-10T11:00:00.000Z" },
++			},
++			graphLedgers: { nodes: jsonl(node), chains: "", sessions: "", coverage: "" },
++			graphFiles: {
++				sources: JSON.stringify({
++					[deadSource]: { id: deadSource, filePath: "notes/dead.md", importedAt: "2026-11-10T09:00:00.000Z" },
++				}),
++				positions: JSON.stringify({ positions: { n_dead: { x: 5, y: 5 } }, updatedAt: "2026-11-10T13:00:00.000Z" }),
++				sourceOrganization: JSON.stringify({
++					version: 1,
++					folders: [],
++					placements: { [deadSource]: { folderId: null } },
++				}),
++			},
++		});
++
++		const res = mergeSyncSnapshots(local, remote, "2026-11-10T14:00:00.000Z");
++		assert.equal(res.ok, true);
++		if (!res.ok) return;
++		const { merged } = res;
++
++		assert.deepEqual(linesOf<GraphNode>(merged.graphLedgers.nodes), [], "deleted-source node must not resurrect");
++		assert.equal(JSON.parse(merged.graphFiles.sources ?? "{}")[deadSource], undefined);
++		const positions = JSON.parse(merged.graphFiles.positions ?? "{}") as { positions: Record<string, unknown> };
++		assert.equal(positions.positions.n_dead, undefined);
++		const org = JSON.parse(merged.graphFiles.sourceOrganization ?? "{}") as {
++			placements: Record<string, unknown>;
++		};
++		assert.equal(org.placements[deadSource], undefined);
++		assert.equal(merged.manifest.deletedGraphSources?.[deadSource], "2026-11-10T11:00:00.000Z");
++	});
++
++	it("keeps a multi-source node, strips tombstoned provenance, and drops aliases from deleted link lines", () => {
++		const deadSource = "src_dead";
++		const create = nodeLine({
++			id: "n_shared",
++			name: "Shared",
++			statement: "The original statement",
++			aliases: ["create alias"],
++			createdAt: "2026-11-10T08:00:00.000Z",
++			provenance: [{ chatId: deadSource, messageId: "m1" }],
++		});
++		const liveLink = nodeLine({
++			id: "n_shared",
++			statement: "Live phrasing",
++			aliases: ["live alias"],
++			provenance: [{ chatId: "chat_live", messageId: "m2" }],
++		});
++		const deadLink = nodeLine({
++			id: "n_shared",
++			statement: "Dead phrasing",
++			aliases: ["dead alias"],
++			createdAt: "2026-11-10T09:00:00.000Z",
++			provenance: [{ chatId: deadSource, messageId: "m3" }],
++		});
++		const local = makeSnapshot({
++			manifest: {
++				version: 1,
++				owner: "hmnty11",
++				updatedAt: "2026-11-10T12:00:00.000Z",
++				deletedChats: {},
++				deletedGraphSources: { [deadSource]: "2026-11-10T11:00:00.000Z" },
++			},
++			graphLedgers: { nodes: jsonl(create), chains: "", sessions: "", coverage: "" },
++		});
++		const remote = makeSnapshot({
++			manifest: { version: 1, owner: "hmnty11", updatedAt: "2026-11-10T10:00:00.000Z", deletedChats: {} },
++			graphLedgers: { nodes: jsonl(liveLink, deadLink), chains: "", sessions: "", coverage: "" },
++		});
++
++		const res = mergeSyncSnapshots(local, remote);
++		assert.equal(res.ok, true);
++		if (!res.ok) return;
++
++		const nodes = linesOf<GraphNode>(res.merged.graphLedgers.nodes);
++		assert.equal(nodes.length, 1, "link lines collapse into the canonical create line");
++		const node = nodes[0]!;
++		assert.equal(node.id, "n_shared");
++		assert.equal(node.name, "Shared");
++		assert.equal(node.statement, "The original statement");
++		assert.deepEqual(node.provenance, [{ chatId: "chat_live", messageId: "m2" }]);
++		assert.deepEqual(node.aliases, ["Live phrasing", "live alias"]);
++	});
++
++	it("kills tombstoned nodes and their chains while unrelated chains survive", () => {
++		const nodes = jsonl(
++			nodeLine({ id: "n_dead", provenance: [{ chatId: "chat_a", messageId: "" }] }),
++			nodeLine({ id: "n_live", provenance: [{ chatId: "chat_a", messageId: "" }] }),
++			nodeLine({ id: "n_concl", provenance: [{ chatId: "chat_a", messageId: "" }] }),
++		);
++		const chains = jsonl(
++			chainLine({
++				id: "arg_dead",
++				premises: ["n_dead"],
++				conclusion: "n_concl",
++				provenance: [{ chatId: "chat_a", messageId: "" }],
++			}),
++			chainLine({
++				id: "arg_live",
++				premises: ["n_live"],
++				conclusion: "n_concl",
++				provenance: [{ chatId: "chat_a", messageId: "" }],
++			}),
++		);
++		const local = makeSnapshot({
++			manifest: {
++				version: 1,
++				owner: "hmnty11",
++				updatedAt: "2026-11-10T12:00:00.000Z",
++				deletedChats: {},
++				deletedGraphNodes: { n_dead: "2026-11-10T11:00:00.000Z" },
++			},
++			graphLedgers: { nodes, chains, sessions: "", coverage: "" },
++			graphFiles: {
++				positions: JSON.stringify({
++					positions: { n_dead: { x: 1, y: 1 }, arg_dead: { x: 2, y: 2 }, n_live: { x: 3, y: 3 } },
++					updatedAt: "2026-11-10T12:00:00.000Z",
++				}),
++			},
++		});
++		const remote = makeSnapshot({
++			manifest: { version: 1, owner: "hmnty11", updatedAt: "2026-11-10T10:00:00.000Z", deletedChats: {} },
++			graphLedgers: { nodes, chains, sessions: "", coverage: "" },
++		});
++
++		const res = mergeSyncSnapshots(local, remote);
++		assert.equal(res.ok, true);
++		if (!res.ok) return;
++
++		assert.deepEqual(linesOf<GraphNode>(res.merged.graphLedgers.nodes).map((n) => n.id), ["n_live", "n_concl"]);
++		assert.deepEqual(linesOf<GraphChain>(res.merged.graphLedgers.chains).map((c) => c.id), ["arg_live"]);
++		const positions = JSON.parse(res.merged.graphFiles.positions ?? "{}") as { positions: Record<string, unknown> };
++		assert.deepEqual(Object.keys(positions.positions).sort(), ["n_live"]);
++	});
++
++	it("keeps a source re-imported after its tombstone and clears the tombstone", () => {
++		const sourceId = "src_reimport";
++		const node = nodeLine({ id: "n_new", provenance: [{ chatId: sourceId, messageId: "" }] });
++		const local = makeSnapshot({
++			manifest: {
++				version: 1,
++				owner: "hmnty11",
++				updatedAt: "2026-11-10T12:00:00.000Z",
++				deletedChats: {},
++				deletedGraphSources: { [sourceId]: "2026-11-10T09:00:00.000Z" },
++			},
++			graphLedgers: { nodes: jsonl(node), chains: "", sessions: "", coverage: "" },
++			graphFiles: {
++				sources: JSON.stringify({
++					[sourceId]: { id: sourceId, filePath: "notes/x.md", importedAt: "2026-11-10T11:00:00.000Z" },
++				}),
++				positions: JSON.stringify({ positions: { n_new: { x: 1, y: 1 } }, updatedAt: "2026-11-10T12:00:00.000Z" }),
++			},
++		});
++		const remote = makeSnapshot({
++			manifest: { version: 1, owner: "hmnty11", updatedAt: "2026-11-10T10:00:00.000Z", deletedChats: {} },
++			graphLedgers: { nodes: "", chains: "", sessions: "", coverage: "" },
++		});
++
++		const res = mergeSyncSnapshots(local, remote);
++		assert.equal(res.ok, true);
++		if (!res.ok) return;
++
++		const sources = JSON.parse(res.merged.graphFiles.sources ?? "{}") as Record<string, unknown>;
++		assert.ok(sources[sourceId], "re-imported source must survive");
++		assert.equal(res.merged.manifest.deletedGraphSources?.[sourceId], undefined, "resurrection clears the tombstone");
++		assert.deepEqual(linesOf<GraphNode>(res.merged.graphLedgers.nodes).map((n) => n.id), ["n_new"]);
++		const positions = JSON.parse(res.merged.graphFiles.positions ?? "{}") as { positions: Record<string, unknown> };
++		assert.deepEqual(Object.keys(positions.positions), ["n_new"]);
++	});
++
++	it("unions tombstones across manifests by max timestamp and lets a newer create resurrect a node", () => {
++		const recreated = nodeLine({
++			id: "n_recreated",
++			createdAt: "2026-11-10T12:30:00.000Z",
++			provenance: [{ chatId: "chat_a", messageId: "" }],
++		});
++		const local = makeSnapshot({
++			manifest: {
++				version: 1,
++				owner: "hmnty11",
++				updatedAt: "2026-11-10T17:00:00.000Z",
++				deletedChats: {},
++				deletedGraphSources: { src_a: "2026-11-10T09:00:00.000Z" },
++				deletedGraphNodes: { n_recreated: "2026-11-10T11:00:00.000Z", n_old: "2026-11-10T11:00:00.000Z" },
++			},
++			graphLedgers: { nodes: jsonl(recreated), chains: "", sessions: "", coverage: "" },
++		});
++		const remote = makeSnapshot({
++			manifest: {
++				version: 1,
++				owner: "hmnty11",
++				updatedAt: "2026-11-10T10:00:00.000Z",
++				deletedChats: {},
++				deletedGraphSources: { src_a: "2026-11-10T10:30:00.000Z" },
++				deletedGraphNodes: { n_recreated: "2026-11-10T12:00:00.000Z" },
++			},
++			graphLedgers: { nodes: jsonl(nodeLine({ id: "n_old", provenance: [{ chatId: "chat_b", messageId: "" }] })), chains: "", sessions: "", coverage: "" },
++		});
++
++		const res = mergeSyncSnapshots(local, remote);
++		assert.equal(res.ok, true);
++		if (!res.ok) return;
++
++		// Source tombstone: remote's later timestamp wins.
++		assert.equal(res.merged.manifest.deletedGraphSources?.src_a, "2026-11-10T10:30:00.000Z");
++		// Node recreated after its tombstone (12:30 > 12:00) resurrects; the stale tombstone clears.
++		assert.equal(res.merged.manifest.deletedGraphNodes?.n_recreated, undefined);
++		assert.deepEqual(linesOf<GraphNode>(res.merged.graphLedgers.nodes).map((n) => n.id), ["n_recreated"]);
++		// n_old keeps its tombstone.
++		assert.equal(res.merged.manifest.deletedGraphNodes?.n_old, "2026-11-10T11:00:00.000Z");
++	});
++
++	it("lets legacy provenance-free nodes and empty-provenance chains ride untouched", () => {
++		const legacyNode = nodeLine({ id: "n_legacy", provenance: [] });
++		const legacyHead = nodeLine({ id: "n_head", provenance: [{ chatId: "chat_a", messageId: "" }] });
++		const chains = jsonl(
++			chainLine({ id: "arg_legacy", premises: ["n_legacy"], conclusion: "n_head", provenance: [] }),
++			chainLine({
++				id: "arg_live",
++				premises: ["n_head"],
++				conclusion: "n_legacy",
++				provenance: [{ chatId: "chat_a", messageId: "" }],
++			}),
++		);
++		const local = makeSnapshot({
++			manifest: {
++				version: 1,
++				owner: "hmnty11",
++				updatedAt: "2026-11-10T12:00:00.000Z",
++				deletedChats: {},
++				deletedGraphSources: { src_unrelated: "2026-11-10T11:00:00.000Z" },
++			},
++			graphLedgers: { nodes: jsonl(legacyNode, legacyHead), chains, sessions: "", coverage: "" },
++		});
++		const remote = makeSnapshot({
++			manifest: { version: 1, owner: "hmnty11", updatedAt: "2026-11-10T10:00:00.000Z", deletedChats: {} },
++			graphLedgers: {
++				nodes: "",
++				chains: "",
++				sessions: "",
++				coverage:
++					jsonl({ chatId: "chat_a", fp: "abc", tokens: 10, foldedAt: "2026-11-10T09:00:00.000Z" }) +
++					jsonl({ chatId: "src_unrelated", fp: "def", tokens: 20, foldedAt: "2026-11-10T09:00:00.000Z" }),
++			},
++			graphFiles: {
++				sources: JSON.stringify({
++					src_kept: { id: "src_kept", filePath: "notes/kept.md", importedAt: "2026-11-10T08:00:00.000Z" },
++				}),
++			},
++		});
++
++		const res = mergeSyncSnapshots(local, remote);
++		assert.equal(res.ok, true);
++		if (!res.ok) return;
++
++		assert.deepEqual(linesOf<GraphNode>(res.merged.graphLedgers.nodes).map((n) => n.id), ["n_legacy", "n_head"]);
++		assert.deepEqual(linesOf<GraphChain>(res.merged.graphLedgers.chains).map((c) => c.id), ["arg_legacy", "arg_live"]);
++		assert.deepEqual(
++			linesOf<{ chatId: string }>(res.merged.graphLedgers.coverage).map((r) => r.chatId),
++			["chat_a"],
++		);
++		const sources = JSON.parse(res.merged.graphFiles.sources ?? "{}") as Record<string, unknown>;
++		assert.deepEqual(Object.keys(sources), ["src_kept"]);
++	});
++});
+diff --git a/tests/sync-service.test.ts b/tests/sync-service.test.ts
+index be6a944..a46f2e5 100644
+--- a/tests/sync-service.test.ts
++++ b/tests/sync-service.test.ts
+@@ -8,7 +8,10 @@ import {
+ 	decryptAuthVault,
+ 	createSyncService,
+ 	recordChatDeleted,
++	recordGraphNodeDeleted,
++	recordGraphSourceDeleted,
+ 	type GitHubSyncPort,
++	type SyncService,
+ } from "../src/server/sync.ts";
+ import type { ChatRecord } from "../src/core/index.ts";
+ 
+@@ -312,3 +315,220 @@ describe("Multi-device Sync & Tombstone Deletion Integration", () => {
+ 		assert.equal(fs.readFileSync(path.join(dirA, "prompts", "shared.md"), "utf-8"), "local mid-sync prompt edit");
+ 	});
+ });
++
++describe("Graph deletion tombstones across devices", () => {
++	let dirA: string;
++	let dirB: string;
++	let authA: string;
++	let authB: string;
++	let github: InMemoryGitHubAdapter;
++	let serviceA: SyncService;
++	let serviceB: SyncService;
++
++	const CREATED_AT = "2026-11-10T08:00:00.000Z";
++
++	const nodeLine = (over: Record<string, unknown> & { id: string }): string =>
++		JSON.stringify({
++			name: over.id,
++			statement: `Statement of ${over.id}`,
++			aliases: [],
++			createdAt: CREATED_AT,
++			provenance: [],
++			...over,
++		}) + "\n";
++
++	const writeGraphFixture = (dir: string): void => {
++		const graphDir = path.join(dir, "graph");
++		fs.mkdirSync(graphDir, { recursive: true });
++		fs.writeFileSync(
++			path.join(graphDir, "nodes.jsonl"),
++			nodeLine({ id: "n_live", provenance: [{ chatId: "c_live", messageId: "m1" }] }) +
++				nodeLine({ id: "n_dead", provenance: [{ chatId: "src_dead", messageId: "" }] }),
++		);
++		fs.writeFileSync(
++			path.join(graphDir, "chains.jsonl"),
++			JSON.stringify({
++				id: "arg_dead",
++				premises: ["n_dead"],
++				conclusion: "n_live",
++				provenance: [{ chatId: "src_dead", messageId: "" }],
++				createdAt: CREATED_AT,
++			}) + "\n",
++		);
++		fs.writeFileSync(
++			path.join(graphDir, "sessions.jsonl"),
++			JSON.stringify({ chatId: "src_dead", foldedAt: CREATED_AT }) + "\n",
++		);
++		fs.writeFileSync(
++			path.join(graphDir, "coverage.jsonl"),
++			JSON.stringify({ chatId: "src_dead", fp: "abc123", tokens: 10, foldedAt: CREATED_AT }) + "\n",
++		);
++		fs.writeFileSync(
++			path.join(graphDir, "sources.json"),
++			JSON.stringify({ src_dead: { id: "src_dead", filePath: "notes/dead.md", importedAt: CREATED_AT } }, null, "\t"),
++		);
++		fs.writeFileSync(
++			path.join(graphDir, "positions.json"),
++			JSON.stringify({ positions: { n_dead: { x: 1, y: 2 } }, updatedAt: CREATED_AT }, null, "\t"),
++		);
++		fs.writeFileSync(
++			path.join(graphDir, "source-organization.json"),
++			JSON.stringify({ version: 1, folders: [], placements: { src_dead: { folderId: null } } }, null, "\t"),
++		);
++	};
++
++	/** Disk state left by deleteSourcesTraces(..., "delete-nodes") + deleteSources. */
++	const writeGraphWithoutDeadSource = (dir: string): void => {
++		const graphDir = path.join(dir, "graph");
++		fs.writeFileSync(
++			path.join(graphDir, "nodes.jsonl"),
++			nodeLine({ id: "n_live", provenance: [{ chatId: "c_live", messageId: "m1" }] }),
++		);
++		fs.writeFileSync(path.join(graphDir, "chains.jsonl"), "");
++		fs.writeFileSync(path.join(graphDir, "sessions.jsonl"), "");
++		fs.writeFileSync(path.join(graphDir, "coverage.jsonl"), "");
++		fs.writeFileSync(path.join(graphDir, "sources.json"), JSON.stringify({}, null, "\t"));
++		fs.writeFileSync(
++			path.join(graphDir, "positions.json"),
++			JSON.stringify({ positions: {}, updatedAt: CREATED_AT }, null, "\t"),
++		);
++		fs.writeFileSync(
++			path.join(graphDir, "source-organization.json"),
++			JSON.stringify({ version: 1, folders: [], placements: {} }, null, "\t"),
++		);
++	};
++
++	const remoteFiles = (): Record<string, string> => github.repos.get("hmnty11/learnharness-sync")!.files;
++	const localFile = (dir: string, rel: string): string => fs.readFileSync(path.join(dir, ...rel.split("/")), "utf-8");
++	const syncConfigOf = (dir: string): Record<string, Record<string, string>> =>
++		JSON.parse(fs.readFileSync(path.join(dir, "sync-config.json"), "utf-8")) as Record<string, Record<string, string>>;
++
++	beforeEach(async () => {
++		dirA = fs.mkdtempSync(path.join(os.tmpdir(), "lh-graphA-"));
++		dirB = fs.mkdtempSync(path.join(os.tmpdir(), "lh-graphB-"));
++		authA = path.join(dirA, "auth.json");
++		authB = path.join(dirB, "auth.json");
++		github = new InMemoryGitHubAdapter();
++		fs.mkdirSync(path.join(dirA, "chats"), { recursive: true });
++		fs.mkdirSync(path.join(dirB, "chats"), { recursive: true });
++		writeGraphFixture(dirA);
++
++		serviceA = createSyncService({ dataDir: dirA, authFile: authA, github });
++		assert.equal((await serviceA.connect({ token: "token_hmnty11" })).ok, true);
++
++		serviceB = createSyncService({ dataDir: dirB, authFile: authB, github });
++		assert.equal((await serviceB.connect({ token: "token_hmnty11" })).ok, true);
++		assert.ok(localFile(dirB, "graph/nodes.jsonl").includes("n_dead"), "device B starts with the stale copy");
++	});
++
++	afterEach(() => {
++		fs.rmSync(dirA, { recursive: true, force: true });
++		fs.rmSync(dirB, { recursive: true, force: true });
++	});
++
++	it("does not resurrect a deleted graph source on a stale device", async () => {
++		writeGraphWithoutDeadSource(dirA);
++		recordGraphSourceDeleted("src_dead", dirA);
++
++		assert.equal((await serviceA.syncNow()).ok, true);
++
++		const remote = remoteFiles();
++		assert.equal(remote["graph/nodes.jsonl"]?.includes("n_dead") ?? false, false, "remote must not carry the deleted node");
++		assert.equal(remote["graph/chains.jsonl"]?.includes("arg_dead") ?? false, false, "remote must not carry the dead chain");
++		assert.equal(remote["graph/sources.json"]?.includes("src_dead") ?? false, false, "remote must not carry the deleted source");
++		const remoteManifest = JSON.parse(remote["manifest.json"]!) as { deletedGraphSources?: Record<string, string> };
++		assert.ok(remoteManifest.deletedGraphSources?.src_dead, "remote manifest carries the source tombstone");
++
++		// Stale device B still has every deleted row on disk.
++		assert.equal((await serviceB.syncNow()).ok, true);
++
++		assert.equal(localFile(dirB, "graph/nodes.jsonl").includes("n_dead"), false, "deleted-source node must not survive on B");
++		assert.equal(localFile(dirB, "graph/chains.jsonl").includes("arg_dead"), false, "dead chain must not survive on B");
++		assert.equal(localFile(dirB, "graph/sessions.jsonl").includes("src_dead"), false, "session checkpoint must not survive on B");
++		assert.equal(localFile(dirB, "graph/coverage.jsonl").includes("src_dead"), false, "coverage must not survive on B");
++		assert.equal(localFile(dirB, "graph/sources.json").includes("src_dead"), false, "source entry must not survive on B");
++		assert.equal(localFile(dirB, "graph/positions.json").includes("n_dead"), false, "resting position must not survive on B");
++		assert.equal(
++			localFile(dirB, "graph/source-organization.json").includes("src_dead"),
++			false,
++			"folder placement must not survive on B",
++		);
++		assert.ok(localFile(dirB, "graph/nodes.jsonl").includes("n_live"), "untouched node must survive on B");
++		assert.equal(typeof syncConfigOf(dirB).deletedGraphSources?.src_dead, "string", "B persists the merged tombstone");
++	});
++
++	it("does not resurrect a deleted node on a stale device", async () => {
++		const graphDir = path.join(dirA, "graph");
++		fs.writeFileSync(
++			path.join(graphDir, "nodes.jsonl"),
++			nodeLine({ id: "n_live", provenance: [{ chatId: "c_live", messageId: "m1" }] }),
++		);
++		fs.writeFileSync(path.join(graphDir, "chains.jsonl"), "");
++		fs.writeFileSync(
++			path.join(graphDir, "positions.json"),
++			JSON.stringify({ positions: {}, updatedAt: CREATED_AT }, null, "\t"),
++		);
++		recordGraphNodeDeleted("n_dead", dirA);
++
++		assert.equal((await serviceA.syncNow()).ok, true);
++		assert.equal(remoteFiles()["graph/nodes.jsonl"]?.includes("n_dead") ?? false, false, "remote must not carry the deleted node");
++
++		assert.equal((await serviceB.syncNow()).ok, true);
++		assert.equal(localFile(dirB, "graph/nodes.jsonl").includes("n_dead"), false, "deleted node must not survive on B");
++		assert.equal(localFile(dirB, "graph/chains.jsonl").includes("arg_dead"), false, "chain on a dead node must not survive on B");
++		assert.equal(localFile(dirB, "graph/positions.json").includes("n_dead"), false, "resting position must not survive on B");
++		assert.ok(localFile(dirB, "graph/nodes.jsonl").includes("n_live"), "untouched node must survive on B");
++		assert.equal(typeof syncConfigOf(dirB).deletedGraphNodes?.n_dead, "string", "B persists the merged tombstone");
++	});
++
++	it("unions graph tombstones by newest timestamp across devices", async () => {
++		const graphDir = path.join(dirA, "graph");
++		fs.writeFileSync(path.join(graphDir, "nodes.jsonl"), nodeLine({ id: "n_live" }));
++		fs.writeFileSync(path.join(graphDir, "positions.json"), JSON.stringify({ positions: {} }, null, "\t"));
++		recordGraphNodeDeleted("n_dead", dirA);
++		assert.equal((await serviceA.syncNow()).ok, true);
++
++		// Device B's local record is NEWER than the remote's tombstone — the max must win.
++		const future = "2099-01-01T00:00:00.000Z";
++		const configB = syncConfigOf(dirB);
++		configB.deletedGraphNodes = { ...(configB.deletedGraphNodes ?? {}), n_dead: future };
++		fs.writeFileSync(path.join(dirB, "sync-config.json"), JSON.stringify(configB, null, "\t"));
++		assert.equal((await serviceB.syncNow()).ok, true);
++
++		const remoteManifest = JSON.parse(remoteFiles()["manifest.json"]!) as { deletedGraphNodes?: Record<string, string> };
++		assert.equal(remoteManifest.deletedGraphNodes?.n_dead, future, "the newer tombstone wins the union");
++		assert.equal(syncConfigOf(dirB).deletedGraphNodes?.n_dead, future, "B keeps the winning timestamp");
++		assert.equal(localFile(dirB, "graph/nodes.jsonl").includes("n_dead"), false);
++	});
++
++	it("keeps a source re-imported after its tombstone and clears the tombstone", async () => {
++		writeGraphWithoutDeadSource(dirA);
++		recordGraphSourceDeleted("src_dead", dirA);
++		assert.equal((await serviceA.syncNow()).ok, true);
++		assert.equal(remoteFiles()["graph/nodes.jsonl"]?.includes("n_dead") ?? false, false);
++
++		// Re-import on A: the source's importedAt and the new node's createdAt both
++		// postdate the tombstone.
++		const graphDir = path.join(dirA, "graph");
++		const importedAt = new Date(Date.now() + 60_000).toISOString();
++		fs.writeFileSync(
++			path.join(graphDir, "sources.json"),
++			JSON.stringify({ src_dead: { id: "src_dead", filePath: "notes/dead.md", importedAt } }, null, "\t"),
++		);
++		fs.appendFileSync(
++			path.join(graphDir, "nodes.jsonl"),
++			nodeLine({ id: "n_reimport", createdAt: importedAt, provenance: [{ chatId: "src_dead", messageId: "" }] }),
++		);
++
++		assert.equal((await serviceA.syncNow()).ok, true);
++		assert.ok(remoteFiles()["graph/nodes.jsonl"]?.includes("n_reimport") ?? false, "re-imported node reaches the remote");
++		const remoteManifest = JSON.parse(remoteFiles()["manifest.json"]!) as { deletedGraphSources?: Record<string, string> };
++		assert.equal(remoteManifest.deletedGraphSources?.src_dead, undefined, "resurrection clears the remote tombstone");
++		assert.equal(syncConfigOf(dirA).deletedGraphSources?.src_dead, undefined, "A's config drops the cleared tombstone");
++
++		// A second sync must not re-kill the re-import.
++		assert.equal((await serviceA.syncNow()).ok, true);
++		assert.ok(remoteFiles()["graph/nodes.jsonl"]?.includes("n_reimport") ?? false, "re-import survives the next sync");
++		assert.ok(localFile(dirA, "graph/nodes.jsonl").includes("n_reimport"), "re-import survives locally");
++	});
++});
+-- 
+2.53.0.windows.1
+
