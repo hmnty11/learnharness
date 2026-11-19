@@ -178,7 +178,7 @@ function modelRows(body: unknown): unknown[] | null {
  *  capability fields; absent or unrecognized → false (text-only). */
 function detectImage(row: Record<string, unknown>): boolean {
 	const architecture = isRecord(row.architecture) ? row.architecture : undefined;
-	const candidates = [
+	const candidates: unknown[] = [
 		architecture?.input_modalities,
 		row.input_modalities,
 		row.modalities,
@@ -188,7 +188,9 @@ function detectImage(row: Record<string, unknown>): boolean {
 	for (const c of candidates) {
 		if (Array.isArray(c) && c.some((v) => typeof v === "string" && /image|vision/i.test(v))) return true;
 	}
-	return false;
+	// OmniRoute-style object capabilities: {"vision": true, …}.
+	const caps = isRecord(row.capabilities) ? row.capabilities : undefined;
+	return caps?.vision === true;
 }
 
 /** Does a /models row advertise reasoning? Metadata only — no name guessing,
@@ -202,12 +204,16 @@ function detectReasoning(row: Record<string, unknown>): boolean {
 		if (row[key] === true) return true;
 	}
 	const architecture = isRecord(row.architecture) ? row.architecture : undefined;
-	const candidates = [row.supported_parameters, row.capabilities, row.tags, architecture?.output_modalities];
-	return candidates.some(
+	const candidates: unknown[] = [row.supported_parameters, row.capabilities, row.tags, architecture?.output_modalities];
+	const listHit = candidates.some(
 		(list) =>
 			Array.isArray(list) &&
 			list.some((v) => typeof v === "string" && (/reasoning/i.test(v) || v.toLowerCase() === "thinking")),
 	);
+	if (listHit) return true;
+	// OmniRoute-style object capabilities: {"reasoning": true, "thinking": true, …}.
+	const caps = isRecord(row.capabilities) ? row.capabilities : undefined;
+	return Boolean(caps && (caps.reasoning === true || caps.supports_reasoning === true || caps.thinking === true));
 }
 
 /** First positive integer among `keys` on a row (endpoints name limits

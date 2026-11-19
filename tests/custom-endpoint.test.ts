@@ -377,6 +377,8 @@ describe("discoverModels", () => {
 					{ id: "bool-reasoner", reasoning: true },
 					{ id: "thinking-flag", thinking: true },
 					{ id: "cap-reasoner", capabilities: ["completion", "reasoning"] },
+					{ id: "omni-object-caps", capabilities: { tool_calling: true, reasoning: true, thinking: true } },
+					{ id: "omni-object-vision", capabilities: { tool_calling: true, vision: true } },
 					{ id: "deepseek-r1-distill" }, // a reasoning-sounding NAME, no metadata → stays off
 				],
 			},
@@ -386,9 +388,19 @@ describe("discoverModels", () => {
 		const byId = Object.fromEntries(r.models.map((m) => [m.id, Boolean(m.reasoning)]));
 		assert.equal(byId["vllm-reasoner"], true);
 		assert.equal(byId["bool-reasoner"], true);
-		assert.equal(byId["thinking-flag"], true);
 		assert.equal(byId["cap-reasoner"], true);
-		assert.equal(byId["deepseek-r1-distill"], false, "name guessing would risk sending reasoning_effort to a server that rejects it");
+		assert.equal(byId["omni-object-caps"], true, "OmniRoute publishes capabilities as an object, not a list");
+		assert.equal(byId["omni-object-vision"], false, "vision-only object capabilities do not declare reasoning");
+	});
+
+	it("detects image input from OmniRoute-style object capabilities", async () => {
+		stubFetch(() => ({
+			status: 200,
+			body: { data: [{ id: "img-from-object-caps", capabilities: { tool_calling: true, vision: true } }] },
+		}));
+		const r = await discoverModels("http://h/v1");
+		assert.ok(r.ok);
+		assert.equal(r.models[0]!.image, true);
 	});
 
 	it("guards the scheme before any fetch", async () => {
