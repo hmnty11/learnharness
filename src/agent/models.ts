@@ -3,12 +3,17 @@ import {
 	createModels,
 	getSupportedThinkingLevels,
 	type Api,
+	type AssistantMessage,
+	type AssistantMessageEvent,
 	type CacheRetention,
 	type Model,
 	type Models,
 	type MutableModels,
+	type SimpleStreamOptions,
 	type StreamFunction,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { lazyApi, lazyStream } from "@earendil-works/pi-ai/api/lazy";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -126,6 +131,97 @@ function defaultThinkingLevel(model: Model<Api>): ThinkingLevel {
 	return supported[0] ?? "off";
 }
 
+
+/** Upstream proxies (9router/OmniRoute, custom OpenAI-compatible endpoints)
+ *  sometimes kill the SSE connection BEFORE any content is produced —
+ *  pi-ai surfaces that as "Stream ended without finish_reason". Nothing was
+ *  shown or persisted, so replaying the request cannot duplicate transcript
+ *  content. Anything else — a non-transient failure, an abort, or a failure
+ *  AFTER visible content — settles as-is: a mid-generation replay could
+ *  double-write the transcript. */
+const TRANSIENT_STREAM_RETRIES = 2;
+const TRANSIENT_STREAM_BACKOFF_MS = [1_000, 3_000] as const;
+const isTransientStreamError = (message: string | undefined): boolean =>
+	Boolean(message && /Stream ended without finish_reason|Stream ended before producing a non-ping SSE event/i.test(message));
+
+/** The zero-usage error AssistantMessage the other stream adapters build
+ *  (chatgpt-stream.ts `empty`, subscription-stream.ts) for failures. */
+function streamFailureMessage(model: Model<Api>, message: string, aborted: boolean): AssistantMessage {
+	return {
+		role: "assistant",
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		content: [],
+		stopReason: aborted ? "aborted" : "error",
+		errorMessage: message,
+		timestamp: Date.now(),
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	};
+}
+
+/** Replay `open()` attempts that die before ANY visible content. An empty
+ *  `start` event is held back (a retried attempt emits its own) until the
+ *  first real event flushes it, so a dead attempt leaks nothing. */
+async function runTransientRetries(model: Model<Api>, open: () => AssistantMessageEventStream, out: AssistantMessageEventStream, signal: AbortSignal | undefined): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		let heldStart: AssistantMessageEvent | undefined;
+		let forwarded = false;
+		try {
+			let replay = false;
+			for await (const event of open()) {
+				if (event.type === "start") {
+					heldStart = event; // not visible content: a retry replaces it
+					continue;
+				}
+				if (
+					event.type === "error" && !forwarded &&
+					isTransientStreamError(event.error.errorMessage) &&
+					attempt < TRANSIENT_STREAM_RETRIES && !signal?.aborted
+				) { replay = true; break; } // died before visible content
+				if (heldStart) { out.push(heldStart); heldStart = undefined; }
+				forwarded = true;
+				out.push(event);
+				if (event.type === "done" || event.type === "error") {
+					out.end(event.type === "done" ? event.message : event.error);
+					return;
+				}
+			}
+			if (!replay) {
+				// Source exhausted without a terminal event: whatever was
+				// forwarded stands; never fabricate a terminal.
+				if (heldStart) out.push(heldStart);
+				out.end();
+				return;
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (forwarded || !isTransientStreamError(message) || attempt >= TRANSIENT_STREAM_RETRIES || signal?.aborted) {
+				// Thrown failures surface as a direct error event (legal before
+				// start per pi-ai's contract); the dead attempt's held start
+				// never escapes.
+				const failure = streamFailureMessage(model, message, signal?.aborted === true);
+				out.push({ type: "error", reason: failure.stopReason as "aborted" | "error", error: failure });
+				out.end(failure);
+				return;
+			}
+			// thrown transient before content: fall through to replay
+		}
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setTimeout(resolve, TRANSIENT_STREAM_BACKOFF_MS[attempt]);
+		await promise;
+	}
+}
+
+/** Wrap ONE bound request: pre-content transient failures replay with
+ *  backoff; the consumer sees a single stream. */
+function withTransientStreamRetry(model: Model<Api>, open: () => AssistantMessageEventStream, signal: AbortSignal | undefined): AssistantMessageEventStream {
+	const out = new AssistantMessageEventStream();
+	void runTransientRetries(model, open, out, signal);
+	return out;
+}
+
+
 /** The production engine for a RESOLVED spec (model slots wave,
  *  2026-09-20): provider-aware catalog lookup + thinking clamp. The API
  *  key is resolved by pi-ai itself from the environment per request (the
@@ -172,17 +268,24 @@ export function piEngineForSpec(spec: ResolvedModelSpec, background: boolean | (
 				// tool-loop steps. Resolve thinking from the ORIGINAL preference (or
 				// existing default order), not a previous metadata snapshot's clamp.
 				// Pi retains the setup of an operation already in flight.
-				const current = piModels();
-				const currentModel = current.getModel(spec.provider, spec.id);
-				if (!currentModel) return lazyStream(requestModel, async () => { throw new Error("The selected custom model is unavailable."); });
-				const currentLevel = thinkingPreference
-					? clampThinkingLevel(currentModel, thinkingPreference)
-					: defaultThinkingLevel(currentModel);
-				return current.streamSimple(permitImages(currentModel), context, { ...requestOptions, reasoning: currentLevel === "off" ? undefined : currentLevel });
+				return withTransientStreamRetry(requestModel, () => {
+					// Re-resolve the custom route per attempt, not per request:
+					// Pi retains setup of an operation in flight, but a replay
+					// RESTARTS the operation, so metadata may have changed.
+					const now = piModels();
+					const nowModel = now.getModel(spec.provider, spec.id);
+					if (!nowModel) {
+						return lazyStream(requestModel, async () => { throw new Error("The selected custom model is unavailable."); });
+					}
+					const nowLevel = thinkingPreference
+						? clampThinkingLevel(nowModel, thinkingPreference)
+						: defaultThinkingLevel(nowModel);
+					return now.streamSimple(permitImages(nowModel), context, { ...requestOptions, reasoning: nowLevel === "off" ? undefined : nowLevel });
+				}, options?.signal);
 			}
 			const purpose = typeof background === "function" ? background : () => background;
 			const stream = spec.provider === "chatgpt" ? chatGPTStream(purpose, lifecycle) : nativeId ? nativeSubscriptionStream(models.getProvider(nativeId)!, purpose, lifecycle) : models.streamSimple.bind(models);
-			return stream(requestModel, context, requestOptions);
+			return withTransientStreamRetry(requestModel, () => stream(requestModel, context, requestOptions), options?.signal);
 		},
 	};
 }
