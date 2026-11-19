@@ -48,6 +48,8 @@ interface LocalSyncConfig {
 	deletedChats: Record<string, string>;
 	deletedPrompts: Record<string, string>;
 	deletedThemes: Record<string, string>;
+	deletedGraphSources: Record<string, string>;
+	deletedGraphNodes: Record<string, string>;
 }
 
 interface LocalSyncSecrets {
@@ -178,6 +180,8 @@ function defaultSyncConfig(): LocalSyncConfig {
 		deletedChats: {},
 		deletedPrompts: {},
 		deletedThemes: {},
+		deletedGraphSources: {},
+		deletedGraphNodes: {},
 	};
 }
 
@@ -204,6 +208,8 @@ function readSyncConfig(dataDir: string): LocalSyncConfig {
 			deletedChats: toStringRecord(raw.deletedChats),
 			deletedPrompts: toStringRecord(raw.deletedPrompts),
 			deletedThemes: toStringRecord(raw.deletedThemes),
+			deletedGraphSources: toStringRecord(raw.deletedGraphSources),
+			deletedGraphNodes: toStringRecord(raw.deletedGraphNodes),
 		};
 	} catch {
 		return defaultSyncConfig();
@@ -247,6 +253,27 @@ export function recordChatDeleted(chatId: string, dataDir: string = PATHS.data):
 	if (!chatId) return;
 	const config = readSyncConfig(dataDir);
 	config.deletedChats[chatId] = new Date().toISOString();
+	writeSyncConfig(dataDir, config);
+}
+
+/** Record a graph-source deletion (the sourceId is also the chatId its
+ *  provenance points carry) so a stale peer cannot union the old rows back. */
+export function recordGraphSourceDeleted(sourceId: string, dataDir: string = PATHS.data): void {
+	if (!sourceId) return;
+	const config = readSyncConfig(dataDir);
+	const iso = new Date().toISOString();
+	const prev = config.deletedGraphSources[sourceId];
+	config.deletedGraphSources[sourceId] = prev && prev > iso ? prev : iso;
+	writeSyncConfig(dataDir, config);
+}
+
+/** Record a graph-node deletion; `arg_` ids name chains. */
+export function recordGraphNodeDeleted(nodeId: string, dataDir: string = PATHS.data): void {
+	if (!nodeId) return;
+	const config = readSyncConfig(dataDir);
+	const iso = new Date().toISOString();
+	const prev = config.deletedGraphNodes[nodeId];
+	config.deletedGraphNodes[nodeId] = prev && prev > iso ? prev : iso;
 	writeSyncConfig(dataDir, config);
 }
 
@@ -550,6 +577,8 @@ function readLocalSnapshot(dataDir: string, config: LocalSyncConfig): SyncSnapsh
 			deletedChats: { ...config.deletedChats },
 			deletedPrompts: { ...config.deletedPrompts },
 			deletedThemes: { ...config.deletedThemes },
+			deletedGraphSources: { ...config.deletedGraphSources },
+			deletedGraphNodes: { ...config.deletedGraphNodes },
 		},
 		chats: readLocalChats(dataDir),
 		graphLedgers: {
@@ -750,6 +779,8 @@ function deserializeRemoteSnapshot(files: Record<string, string>): SyncSnapshot 
 		deletedChats: toStringMap(rawManifest.deletedChats),
 		deletedPrompts: toStringMap(rawManifest.deletedPrompts),
 		deletedThemes: toStringMap(rawManifest.deletedThemes),
+		deletedGraphSources: toStringMap(rawManifest.deletedGraphSources),
+		deletedGraphNodes: toStringMap(rawManifest.deletedGraphNodes),
 	};
 
 	let meta: SyncMeta = {};
@@ -1028,6 +1059,8 @@ export function createSyncService(options: CreateSyncServiceOptions = {}): SyncS
 				deletedChats: mergedSnapshot.manifest.deletedChats,
 				deletedPrompts: mergedSnapshot.manifest.deletedPrompts ?? {},
 				deletedThemes: mergedSnapshot.manifest.deletedThemes ?? {},
+			deletedGraphSources: mergedSnapshot.manifest.deletedGraphSources ?? {},
+			deletedGraphNodes: mergedSnapshot.manifest.deletedGraphNodes ?? {},
 			};
 			writeSyncConfig(dataDir, updatedConfig);
 

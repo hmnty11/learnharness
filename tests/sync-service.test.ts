@@ -8,7 +8,10 @@ import {
 	decryptAuthVault,
 	createSyncService,
 	recordChatDeleted,
+	recordGraphNodeDeleted,
+	recordGraphSourceDeleted,
 	type GitHubSyncPort,
+	type SyncService,
 } from "../src/server/sync.ts";
 import type { ChatRecord } from "../src/core/index.ts";
 
@@ -310,5 +313,222 @@ describe("Multi-device Sync & Tombstone Deletion Integration", () => {
 		// 3. mid-sync prompt must NOT be deleted (Issue 1), and shared.md must NOT be overwritten (Issue 2)
 		assert.ok(fs.existsSync(path.join(dirA, "prompts", "mid-sync.md")), "prompts/mid-sync.md must not be deleted");
 		assert.equal(fs.readFileSync(path.join(dirA, "prompts", "shared.md"), "utf-8"), "local mid-sync prompt edit");
+	});
+});
+
+describe("Graph deletion tombstones across devices", () => {
+	let dirA: string;
+	let dirB: string;
+	let authA: string;
+	let authB: string;
+	let github: InMemoryGitHubAdapter;
+	let serviceA: SyncService;
+	let serviceB: SyncService;
+
+	const CREATED_AT = "2026-11-10T08:00:00.000Z";
+
+	const nodeLine = (over: Record<string, unknown> & { id: string }): string =>
+		JSON.stringify({
+			name: over.id,
+			statement: `Statement of ${over.id}`,
+			aliases: [],
+			createdAt: CREATED_AT,
+			provenance: [],
+			...over,
+		}) + "\n";
+
+	const writeGraphFixture = (dir: string): void => {
+		const graphDir = path.join(dir, "graph");
+		fs.mkdirSync(graphDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(graphDir, "nodes.jsonl"),
+			nodeLine({ id: "n_live", provenance: [{ chatId: "c_live", messageId: "m1" }] }) +
+				nodeLine({ id: "n_dead", provenance: [{ chatId: "src_dead", messageId: "" }] }),
+		);
+		fs.writeFileSync(
+			path.join(graphDir, "chains.jsonl"),
+			JSON.stringify({
+				id: "arg_dead",
+				premises: ["n_dead"],
+				conclusion: "n_live",
+				provenance: [{ chatId: "src_dead", messageId: "" }],
+				createdAt: CREATED_AT,
+			}) + "\n",
+		);
+		fs.writeFileSync(
+			path.join(graphDir, "sessions.jsonl"),
+			JSON.stringify({ chatId: "src_dead", foldedAt: CREATED_AT }) + "\n",
+		);
+		fs.writeFileSync(
+			path.join(graphDir, "coverage.jsonl"),
+			JSON.stringify({ chatId: "src_dead", fp: "abc123", tokens: 10, foldedAt: CREATED_AT }) + "\n",
+		);
+		fs.writeFileSync(
+			path.join(graphDir, "sources.json"),
+			JSON.stringify({ src_dead: { id: "src_dead", filePath: "notes/dead.md", importedAt: CREATED_AT } }, null, "\t"),
+		);
+		fs.writeFileSync(
+			path.join(graphDir, "positions.json"),
+			JSON.stringify({ positions: { n_dead: { x: 1, y: 2 } }, updatedAt: CREATED_AT }, null, "\t"),
+		);
+		fs.writeFileSync(
+			path.join(graphDir, "source-organization.json"),
+			JSON.stringify({ version: 1, folders: [], placements: { src_dead: { folderId: null } } }, null, "\t"),
+		);
+	};
+
+	/** Disk state left by deleteSourcesTraces(..., "delete-nodes") + deleteSources. */
+	const writeGraphWithoutDeadSource = (dir: string): void => {
+		const graphDir = path.join(dir, "graph");
+		fs.writeFileSync(
+			path.join(graphDir, "nodes.jsonl"),
+			nodeLine({ id: "n_live", provenance: [{ chatId: "c_live", messageId: "m1" }] }),
+		);
+		fs.writeFileSync(path.join(graphDir, "chains.jsonl"), "");
+		fs.writeFileSync(path.join(graphDir, "sessions.jsonl"), "");
+		fs.writeFileSync(path.join(graphDir, "coverage.jsonl"), "");
+		fs.writeFileSync(path.join(graphDir, "sources.json"), JSON.stringify({}, null, "\t"));
+		fs.writeFileSync(
+			path.join(graphDir, "positions.json"),
+			JSON.stringify({ positions: {}, updatedAt: CREATED_AT }, null, "\t"),
+		);
+		fs.writeFileSync(
+			path.join(graphDir, "source-organization.json"),
+			JSON.stringify({ version: 1, folders: [], placements: {} }, null, "\t"),
+		);
+	};
+
+	const remoteFiles = (): Record<string, string> => github.repos.get("hmnty11/learnharness-sync")!.files;
+	const localFile = (dir: string, rel: string): string => fs.readFileSync(path.join(dir, ...rel.split("/")), "utf-8");
+	const syncConfigOf = (dir: string): Record<string, Record<string, string>> =>
+		JSON.parse(fs.readFileSync(path.join(dir, "sync-config.json"), "utf-8")) as Record<string, Record<string, string>>;
+
+	beforeEach(async () => {
+		dirA = fs.mkdtempSync(path.join(os.tmpdir(), "lh-graphA-"));
+		dirB = fs.mkdtempSync(path.join(os.tmpdir(), "lh-graphB-"));
+		authA = path.join(dirA, "auth.json");
+		authB = path.join(dirB, "auth.json");
+		github = new InMemoryGitHubAdapter();
+		fs.mkdirSync(path.join(dirA, "chats"), { recursive: true });
+		fs.mkdirSync(path.join(dirB, "chats"), { recursive: true });
+		writeGraphFixture(dirA);
+
+		serviceA = createSyncService({ dataDir: dirA, authFile: authA, github });
+		assert.equal((await serviceA.connect({ token: "token_hmnty11" })).ok, true);
+
+		serviceB = createSyncService({ dataDir: dirB, authFile: authB, github });
+		assert.equal((await serviceB.connect({ token: "token_hmnty11" })).ok, true);
+		assert.ok(localFile(dirB, "graph/nodes.jsonl").includes("n_dead"), "device B starts with the stale copy");
+	});
+
+	afterEach(() => {
+		fs.rmSync(dirA, { recursive: true, force: true });
+		fs.rmSync(dirB, { recursive: true, force: true });
+	});
+
+	it("does not resurrect a deleted graph source on a stale device", async () => {
+		writeGraphWithoutDeadSource(dirA);
+		recordGraphSourceDeleted("src_dead", dirA);
+
+		assert.equal((await serviceA.syncNow()).ok, true);
+
+		const remote = remoteFiles();
+		assert.equal(remote["graph/nodes.jsonl"]?.includes("n_dead") ?? false, false, "remote must not carry the deleted node");
+		assert.equal(remote["graph/chains.jsonl"]?.includes("arg_dead") ?? false, false, "remote must not carry the dead chain");
+		assert.equal(remote["graph/sources.json"]?.includes("src_dead") ?? false, false, "remote must not carry the deleted source");
+		const remoteManifest = JSON.parse(remote["manifest.json"]!) as { deletedGraphSources?: Record<string, string> };
+		assert.ok(remoteManifest.deletedGraphSources?.src_dead, "remote manifest carries the source tombstone");
+
+		// Stale device B still has every deleted row on disk.
+		assert.equal((await serviceB.syncNow()).ok, true);
+
+		assert.equal(localFile(dirB, "graph/nodes.jsonl").includes("n_dead"), false, "deleted-source node must not survive on B");
+		assert.equal(localFile(dirB, "graph/chains.jsonl").includes("arg_dead"), false, "dead chain must not survive on B");
+		assert.equal(localFile(dirB, "graph/sessions.jsonl").includes("src_dead"), false, "session checkpoint must not survive on B");
+		assert.equal(localFile(dirB, "graph/coverage.jsonl").includes("src_dead"), false, "coverage must not survive on B");
+		assert.equal(localFile(dirB, "graph/sources.json").includes("src_dead"), false, "source entry must not survive on B");
+		assert.equal(localFile(dirB, "graph/positions.json").includes("n_dead"), false, "resting position must not survive on B");
+		assert.equal(
+			localFile(dirB, "graph/source-organization.json").includes("src_dead"),
+			false,
+			"folder placement must not survive on B",
+		);
+		assert.ok(localFile(dirB, "graph/nodes.jsonl").includes("n_live"), "untouched node must survive on B");
+		assert.equal(typeof syncConfigOf(dirB).deletedGraphSources?.src_dead, "string", "B persists the merged tombstone");
+	});
+
+	it("does not resurrect a deleted node on a stale device", async () => {
+		const graphDir = path.join(dirA, "graph");
+		fs.writeFileSync(
+			path.join(graphDir, "nodes.jsonl"),
+			nodeLine({ id: "n_live", provenance: [{ chatId: "c_live", messageId: "m1" }] }),
+		);
+		fs.writeFileSync(path.join(graphDir, "chains.jsonl"), "");
+		fs.writeFileSync(
+			path.join(graphDir, "positions.json"),
+			JSON.stringify({ positions: {}, updatedAt: CREATED_AT }, null, "\t"),
+		);
+		recordGraphNodeDeleted("n_dead", dirA);
+
+		assert.equal((await serviceA.syncNow()).ok, true);
+		assert.equal(remoteFiles()["graph/nodes.jsonl"]?.includes("n_dead") ?? false, false, "remote must not carry the deleted node");
+
+		assert.equal((await serviceB.syncNow()).ok, true);
+		assert.equal(localFile(dirB, "graph/nodes.jsonl").includes("n_dead"), false, "deleted node must not survive on B");
+		assert.equal(localFile(dirB, "graph/chains.jsonl").includes("arg_dead"), false, "chain on a dead node must not survive on B");
+		assert.equal(localFile(dirB, "graph/positions.json").includes("n_dead"), false, "resting position must not survive on B");
+		assert.ok(localFile(dirB, "graph/nodes.jsonl").includes("n_live"), "untouched node must survive on B");
+		assert.equal(typeof syncConfigOf(dirB).deletedGraphNodes?.n_dead, "string", "B persists the merged tombstone");
+	});
+
+	it("unions graph tombstones by newest timestamp across devices", async () => {
+		const graphDir = path.join(dirA, "graph");
+		fs.writeFileSync(path.join(graphDir, "nodes.jsonl"), nodeLine({ id: "n_live" }));
+		fs.writeFileSync(path.join(graphDir, "positions.json"), JSON.stringify({ positions: {} }, null, "\t"));
+		recordGraphNodeDeleted("n_dead", dirA);
+		assert.equal((await serviceA.syncNow()).ok, true);
+
+		// Device B's local record is NEWER than the remote's tombstone — the max must win.
+		const future = "2099-01-01T00:00:00.000Z";
+		const configB = syncConfigOf(dirB);
+		configB.deletedGraphNodes = { ...(configB.deletedGraphNodes ?? {}), n_dead: future };
+		fs.writeFileSync(path.join(dirB, "sync-config.json"), JSON.stringify(configB, null, "\t"));
+		assert.equal((await serviceB.syncNow()).ok, true);
+
+		const remoteManifest = JSON.parse(remoteFiles()["manifest.json"]!) as { deletedGraphNodes?: Record<string, string> };
+		assert.equal(remoteManifest.deletedGraphNodes?.n_dead, future, "the newer tombstone wins the union");
+		assert.equal(syncConfigOf(dirB).deletedGraphNodes?.n_dead, future, "B keeps the winning timestamp");
+		assert.equal(localFile(dirB, "graph/nodes.jsonl").includes("n_dead"), false);
+	});
+
+	it("keeps a source re-imported after its tombstone and clears the tombstone", async () => {
+		writeGraphWithoutDeadSource(dirA);
+		recordGraphSourceDeleted("src_dead", dirA);
+		assert.equal((await serviceA.syncNow()).ok, true);
+		assert.equal(remoteFiles()["graph/nodes.jsonl"]?.includes("n_dead") ?? false, false);
+
+		// Re-import on A: the source's importedAt and the new node's createdAt both
+		// postdate the tombstone.
+		const graphDir = path.join(dirA, "graph");
+		const importedAt = new Date(Date.now() + 60_000).toISOString();
+		fs.writeFileSync(
+			path.join(graphDir, "sources.json"),
+			JSON.stringify({ src_dead: { id: "src_dead", filePath: "notes/dead.md", importedAt } }, null, "\t"),
+		);
+		fs.appendFileSync(
+			path.join(graphDir, "nodes.jsonl"),
+			nodeLine({ id: "n_reimport", createdAt: importedAt, provenance: [{ chatId: "src_dead", messageId: "" }] }),
+		);
+
+		assert.equal((await serviceA.syncNow()).ok, true);
+		assert.ok(remoteFiles()["graph/nodes.jsonl"]?.includes("n_reimport") ?? false, "re-imported node reaches the remote");
+		const remoteManifest = JSON.parse(remoteFiles()["manifest.json"]!) as { deletedGraphSources?: Record<string, string> };
+		assert.equal(remoteManifest.deletedGraphSources?.src_dead, undefined, "resurrection clears the remote tombstone");
+		assert.equal(syncConfigOf(dirA).deletedGraphSources?.src_dead, undefined, "A's config drops the cleared tombstone");
+
+		// A second sync must not re-kill the re-import.
+		assert.equal((await serviceA.syncNow()).ok, true);
+		assert.ok(remoteFiles()["graph/nodes.jsonl"]?.includes("n_reimport") ?? false, "re-import survives the next sync");
+		assert.ok(localFile(dirA, "graph/nodes.jsonl").includes("n_reimport"), "re-import survives locally");
 	});
 });

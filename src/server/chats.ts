@@ -9,7 +9,7 @@ import { isTurnRunning } from "./turn-liveness.ts";
 import { clearTurnFailure } from "./turn-runs.ts";
 import { discardChatDeliveries } from "./jobs.ts";
 import { sideChats } from "./side-chat.ts";
-import { recordChatDeleted } from "./sync.ts";
+import { recordChatDeleted, recordGraphSourceDeleted } from "./sync.ts";
 
 /**
  * Server-side chat entries for the transport layer (app/api/chats*,
@@ -145,6 +145,8 @@ function finishChatDeletion(chatId: string, mode: ChatDeleteMode): Extract<ChatD
 	// THE SYNC BLOCK — no awaits below (see the doc comment). Order:
 	// ledgers → jobs → the chat record.
 	const stats = deleteChatTraces(stores.graphStore, chatId, mode);
+	// Preserve-graph keeps the nodes, so only the full purge tombstones the source.
+	if (mode === "delete-nodes") recordGraphSourceDeleted(chatId);
 	const jobsRemoved = finishChatRecordDeletion(chatId);
 	return { ok: true, mode, stats, jobsRemoved, graphRevision: graphRevision() };
 }

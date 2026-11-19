@@ -12,6 +12,7 @@ import {
 import { extractionStatuses } from "../agent/subagents/extraction.ts";
 import { stores } from "./stores.ts";
 import { callCost } from "./pricing.ts";
+import { recordGraphNodeDeleted } from "./sync.ts";
 
 /**
  * Server-side graph entry for the home view (GET /api/graph). A PURE READ:
@@ -118,6 +119,7 @@ export function deleteGraphNode(nodeId: string): NodeDeleteOutcome {
 	if (stats === null) {
 		return { ok: false, status: 404, code: "not_found", error: "No such node" };
 	}
+	recordGraphNodeDeleted(nodeId);
 	return { ok: true, stats, graphRevision: graphRevision() };
 }
 
