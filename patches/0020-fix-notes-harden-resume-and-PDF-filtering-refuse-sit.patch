@@ -1,0 +1,892 @@
+From 0f65a0f4a451ec9af713ec8f3599d4ee60b11903 Mon Sep 17 00:00:00 2001
+From: hmty11 <darrenjeho@gmail.com>
+Date: Thu, 19 Nov 2026 08:31:03 +0800
+Subject: [PATCH 20/20] fix(notes): harden resume and PDF filtering; refuse
+ site-local fetches
+
+- Restore layout on full-prefix retries and discard invalid optional checkpoints safely.
+- Classify navigation before header cleanup and constrain external conversion after PDF preflight.
+- Preserve mixed prose, report filtered-empty PDFs, and deny fec0::/10.
+---
+ app/api/graph/import/route.ts            |  20 ++-
+ docs/architecture.md                     |   4 +-
+ docs/plugin-api/contracts-graph.md       |  17 +-
+ src/agent/subagents/extraction.ts        |  30 ++--
+ src/agent/subagents/pdf-markdown.ts      |   6 +-
+ src/agent/tools/safe-fetch.ts            |   1 +
+ src/core/contracts/graph.ts              |  17 +-
+ src/store/graph.ts                       |  14 +-
+ tests/extraction-resume.test.ts          | 144 +++++++++++++++++
+ tests/notes-import-pdf-converter.test.ts | 189 +++++++++++++++++++++++
+ tests/notes-import-route.test.ts         |  82 ++++++++++
+ tests/notes-source-resume-store.test.ts  |  76 +++++++++
+ tests/pdf-content-filter.test.ts         |  26 ++++
+ tests/safe-fetch.test.ts                 |   7 +
+ 14 files changed, 589 insertions(+), 44 deletions(-)
+ create mode 100644 tests/notes-import-pdf-converter.test.ts
+ create mode 100644 tests/notes-source-resume-store.test.ts
+
+diff --git a/app/api/graph/import/route.ts b/app/api/graph/import/route.ts
+index a7d4438..62d77d8 100644
+--- a/app/api/graph/import/route.ts
++++ b/app/api/graph/import/route.ts
+@@ -73,11 +73,7 @@ async function readNotesFile(file: File, ocrEnabled: boolean = false): Promise<N
+ 		if (bytes.subarray(0, 8192).includes(0)) return { kind: "refused", error: "This file isn't plain text." };
+ 		return { kind: "notes", text: new TextDecoder().decode(bytes) };
+ 	}
+-	const markitdown = await convertPdfWithMarkitdown(bytes, file.name);
+-	if (markitdown) {
+-		return { kind: "notes", text: markitdown.markdown, notice: markitdown.notices.join(" ") };
+-	}
+-	const pdf = await convertPdf(bytes, MAX_PDF_PAGES);
++	const pdf = await convertPdf(bytes.slice(), MAX_PDF_PAGES);
+ 	switch (pdf.kind) {
+ 		case "unreadable":
+ 			return { kind: "refused", error: "Could not open this PDF." };
+@@ -88,15 +84,23 @@ async function readNotesFile(file: File, ocrEnabled: boolean = false): Promise<N
+ 			let ocrNotice = "";
+ 			const needsOcr = ocrEnabled && (pages.some((page) => page.kind === "image-only") || !pages.some((page) => page.kind === "text" && page.markdown.trim()));
+ 			if (needsOcr) {
+-				const ocrResult = await applyBaiduOcrToPdf(bytes, pages);
++				const ocrResult = await applyBaiduOcrToPdf(bytes.slice(), pages);
+ 				pages = ocrResult.pages;
+ 				if (ocrResult.ocrCount > 0) {
+ 					ocrNotice = " Processed with Baidu OCR.";
+ 				}
+ 			}
+-			pages = cleanRepeatingHeadersFooters(pages);
+ 			const filtered = filterNonContentPages(pages);
+-			pages = filtered.pages;
++			pages = cleanRepeatingHeadersFooters(filtered.pages);
++			if (filtered.skippedCount > 0 && !pages.some((page) => page.kind === "text" && page.markdown.trim())) {
++				return { kind: "refused", error: "No content remains after skipping contents/index pages." };
++			}
++			if (filtered.skippedCount === 0 && !ocrNotice) {
++				const markitdown = await convertPdfWithMarkitdown(bytes, file.name);
++				if (markitdown?.markdown.trim()) {
++					return { kind: "notes", text: markitdown.markdown, notice: markitdown.notices.join(" ") };
++				}
++			}
+ 			const text = joinPages(pages);
+ 			if (!text) return { kind: "refused", error: "OCR not supported yet." };
+ 			const skipped = pages.filter((page) => page.kind === "image-only").length;
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 5d81013..42bc342 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -128,7 +128,7 @@ The [extractor](../src/agent/subagents/extraction.ts) reads source text and prop
+ 
+ `POST /api/graph/import` feeds text or locally converted PDF Markdown into the same pipeline, without chat-message anchors. Before source registration or extraction, the route enforces the shared filename-extension list, recognizes PDFs by their `%PDF-` header, and refuses other files containing a zero byte in the first 8 KiB. Non-PDF files are decoded as UTF-8; the zero-byte rule is a limited binary-file heuristic, not complete text or encoding validation. The [import UI](../components/notes-import.tsx) queues one request per supported file, up to three in flight. Files are capped at 25 MiB; server aggregate file bytes per request are also capped at 25 MiB, with a 26 MiB multipart/proxy bound. PDF text comes from pdfjs (page Markdown) or MarkItDown; `.docx` files are converted with a Node DOCX reader. Image-only pages are reported and skipped unless the opt-in Baidu OCR switch is on, in which case PaddleOCR (local CLI) or the Baidu Cloud API fills just those pages; scanner caveats are still reported.
+ 
+-Source identity hashes the original path/name; safe folder-relative paths can be supplied alongside matching filenames. Renaming or reorganizing a displayed source does not change its identity. PDF pages that are navigational back/front matter (a table-of-contents or index heading whose body is mostly entry lines) are dropped before joining, so they cost no extractor calls; an ambiguous page is kept. A completed import still processes the whole file, even unchanged text, and retry is not exactly-once processing. A stopped run is the one exception: `NotesSource.resume` records the chunking inputs' fingerprint and the leading chunks already merged, so re-uploading the same text at the same chunk budget resumes at the first unfinished chunk. A different text or chunk budget changes the fingerprint and starts from chunk 1; completing the run clears the checkpoint. Same-source overlap is refused as busy. Per-file outcomes distinguish completed, partial, failed, aborted, and busy; zero findings can still be a completed import.
++Source identity hashes the original path/name; safe folder-relative paths can be supplied alongside matching filenames. Renaming or reorganizing a displayed source does not change its identity. PDF navigation pages are dropped only when a contents/index heading is followed by at least three entries and every nonempty body line matches an entry; mixed or ambiguous pages are kept. The route checks the 1,000-page PDF limit before optional external conversion, applies enabled OCR before navigation classification, and classifies pages before stripping repeated headers. Whole-document MarkItDown output is used only when no navigation pages were removed and OCR recognized no pages, so it cannot restore skipped navigation or replace recognized scan text. A PDF with no content left after filtering is refused separately from an image-only PDF that needs OCR. A completed import still processes the whole file, even unchanged text, and retry is not exactly-once processing. A stopped run is the one exception: `NotesSource.resume` records the chunking inputs' fingerprint and the leading chunks already merged. Re-uploading the same text at the same chunk budget resumes at the first unfinished chunk. If all chunks merged before bookkeeping failed, retry repairs layout and can finish without calling the extractor again; the original bookkeeping failure is still reported. Invalid checkpoints are ignored without deleting source metadata or usage history. Changed text or chunk budget starts from chunk 1; completing the run clears the checkpoint. Same-source overlap is refused as busy. Per-file outcomes distinguish completed, partial, failed, aborted, and busy; zero findings can still be a completed import.
+ 
+ `graph/source-organization.json` holds display overrides and folder placement, not original file contents. Folder imports reconstruct directories containing supported files. Organization is separate from session-sidebar placement. Both the chains browser and practice’s node picker hide practice-session source rows; this is a read projection, not deletion of conversations, graph contributions or placements. Folder selection excludes those hidden sources. Empty source names are muted in place, using full contents rather than search-filtered counts. Ordinary chains-view selection selects sources/folders, including descendants hidden by search; practice can select finer-grained graph material.
+ 
+@@ -179,7 +179,7 @@ The **sensitive-path guard** refuses known private home locations, `.env` files,
+ 
+ File/PDF/visual images share image postprocessing. Search supports Tavily, Brave, Exa, Firecrawl, and hosted Ollama adapters; page fetching is independent and does not need a search key. Dictation mints short-lived tokens server-side and streams audio browser → Deepgram. These external effects are not isolated by a scratch data directory alone.
+ 
+-Research page/PDF fetches validate IP literals and every DNS candidate before connecting, then recheck the reported peer when available. Each new connection resolves and validates again; redirects pass through the same guard. This avoids relying on `remoteAddress`, which can be empty for configured sockets on Windows, without permitting private DNS results. TLS certificate and hostname validation remain enabled.
++Research page/PDF fetches validate IP literals and every DNS candidate before connecting, then recheck the reported peer when available. Private, link-local, and deprecated IPv6 site-local addresses are refused. Each new connection resolves and validates again; redirects pass through the same guard. This avoids relying on `remoteAddress`, which can be empty for configured sockets on Windows, without permitting private DNS results. TLS certificate and hostname validation remain enabled.
+ 
+ ## Trusted local plugins (API v1)
+ 
+diff --git a/docs/plugin-api/contracts-graph.md b/docs/plugin-api/contracts-graph.md
+index 9697279..4af8610 100644
+--- a/docs/plugin-api/contracts-graph.md
++++ b/docs/plugin-api/contracts-graph.md
+@@ -562,9 +562,8 @@ importedAt: string;
+ 
+ ### NotesSource contentFp
+ 
+-Legacy content fingerprint. Accepted when reading old records, but
+-ignored: every explicit notes import processes the whole file. New
+-imports do not compute or write this field. No migration is needed.
++Legacy content fingerprint, ignored by extraction. New imports use
++resume.fp for incomplete runs and do not write this field.
+ 
+ ```ts
+ contentFp?: string;
+@@ -572,11 +571,13 @@ contentFp?: string;
+ 
+ ### NotesSource resume
+ 
+-Incomplete-run checkpoint: the chunking inputs' fingerprint plus the
+-leading chunks already merged. Written after each merged chunk and
+-cleared when a run completes, so a stopped import of the same file
+-text resumes at `done` instead of re-paying earlier chunks. A changed
+-file (or chunk size) has a different fp and starts from the top.
++Incomplete-run checkpoint: fp is 32 lowercase hex characters; chunks
++and done are positive safe integers with done <= chunks. Persisted
++after each leading merge, before layout and usage. A full prefix can
++remain if cleanup fails; a matching retry skips all model calls and
++clears it. Completion clears it so the next explicit import runs whole.
++Changed text or chunk budget clears an incompatible checkpoint before
++extraction. Disk reads discard invalid resume data, not its source.
+ 
+ ```ts
+ resume?: {
+diff --git a/src/agent/subagents/extraction.ts b/src/agent/subagents/extraction.ts
+index 49279d8..48377de 100644
+--- a/src/agent/subagents/extraction.ts
++++ b/src/agent/subagents/extraction.ts
+@@ -1371,9 +1371,13 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 			const fp = crypto.createHash("sha256").update(`${chunkTokens}\n${input.text}`).digest("hex").slice(0, 32);
+ 			const prevResume = graphStore.readSources().find((source) => source.id === id)?.resume;
+ 			const resumeFrom = prevResume && prevResume.fp === fp && prevResume.chunks === chunks.length
+-				&& prevResume.done > 0 && prevResume.done < chunks.length
++				&& Number.isSafeInteger(prevResume.chunks) && prevResume.chunks > 0
++				&& Number.isSafeInteger(prevResume.done) && prevResume.done > 0 && prevResume.done <= chunks.length
+ 				? prevResume.done
+ 				: 0;
++			if (prevResume && resumeFrom === 0) {
++				graphStore.upsertSource({ id, filePath: input.filePath, importedAt: input.importedAt });
++			}
+ 			console.info(
+ 				`[extraction ${id}] notes pipeline start (${input.filePath}) — ${chunks.length} chunk(s) of ≤${chunkTokens} tok` +
+ 					(resumeFrom > 0 ? `, resuming after ${resumeFrom} merged chunk(s)` : ""),
+@@ -1387,8 +1391,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 			// part rides the registry entry (feed suffix "· i/N") only when
+ 			// the file actually chunked.
+ 			const settled: PromiseSettledResult<EmissionStats>[] = [];
+-			// Leading chunks that have ever merged for this fingerprint — the
+-			// resume point only advances across a failed chunk, never past it.
++			// Only a successfully persisted leading merge advances the resume point.
+ 			let completedPrefix = resumeFrom;
+ 			for (const [chunkIndex, chunk] of chunks.entries()) {
+ 				if (chunkIndex < resumeFrom) continue;
+@@ -1423,22 +1426,20 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 								mergedStats.chains! += merged.chains ?? 0;
+ 								if (merged.droppedChains)
+ 									mergedStats.droppedChains = (mergedStats.droppedChains ?? 0) + merged.droppedChains;
+-								// The layout ledger evolves with each merge — the next
+-								// snapshot fetch reflects every finished chunk.
+-								settleGraphLayout(graphStore);
+-								console.info(`[extraction ${jobKey}] merged: ${merged.nodes} nodes, ${merged.chains ?? 0} chains`);
+-								// Checkpoint AFTER the merge landed: a crash or stop
+-								// between chunks then costs at most one re-extracted
+-								// chunk, never the whole file.
++								// Persist the committed prefix before layout or usage can fail.
+ 								if (chunkIndex === completedPrefix) {
+-									completedPrefix = chunkIndex + 1;
+ 									graphStore.upsertSource({
+ 										id,
+ 										filePath: input.filePath,
+ 										importedAt: input.importedAt,
+-										resume: { fp, chunks: chunks.length, done: completedPrefix },
++										resume: { fp, chunks: chunks.length, done: chunkIndex + 1 },
+ 									});
++									completedPrefix = chunkIndex + 1;
+ 								}
++								// The layout ledger evolves with each merge — the next
++								// snapshot fetch reflects every finished chunk.
++								settleGraphLayout(graphStore);
++								console.info(`[extraction ${jobKey}] merged: ${merged.nodes} nodes, ${merged.chains ?? 0} chains`);
+ 								return merged;
+ 							});
+ 						}),
+@@ -1469,6 +1470,7 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 				const details = rejected.map((r) => r.reason instanceof Error ? r.reason.message : String(r.reason)).join("; ");
+ 				throw new NotesImportError(outcome, mergedStats, details || "Notes import did not complete");
+ 			}
++			if (resumeFrom > 0 && resumeFrom === chunks.length) settleGraphLayout(graphStore);
+ 			// Completed: the checkpoint has no further use. Another explicit
+ 			// import of this file processes it whole, as before.
+ 			graphStore.upsertSource({ id, filePath: input.filePath, importedAt: input.importedAt });
+@@ -1487,8 +1489,8 @@ export function createExtractionPipeline(deps: ExtractionPipelineDeps): Extracti
+ 		}
+ 	}
+ 
+-	/** Every explicit import processes the whole file. Identity, source digest,
+-	 * auditor and usage history remain source-scoped; this is not exactly-once. */
++	/** Resume an incomplete import of matching text and chunk budget. After a
++	 * completed run, the next explicit import processes the whole file. */
+ 	async function importNotes(input: NotesImportInput): Promise<EmissionStats> {
+ 		const id = `src_${crypto.createHash("sha256").update(input.filePath).digest("hex").slice(0, 12)}`;
+ 		// Acquire BEFORE source upsert: overlapping contents must not alter metadata.
+diff --git a/src/agent/subagents/pdf-markdown.ts b/src/agent/subagents/pdf-markdown.ts
+index 07ebf4a..6b035bc 100644
+--- a/src/agent/subagents/pdf-markdown.ts
++++ b/src/agent/subagents/pdf-markdown.ts
+@@ -356,7 +356,7 @@ const INDEX_ENTRY = /^\s*[^,]{2,60},\s*\d{1,4}(?:\s*[-,–]\s*\d{1,4})?(?:\s*,\s
+  * Drops navigational front/back matter (table of contents, index) that would
+  * otherwise cost extractor+auditor calls for propositions the book already
+  * states. Conservative: a page is only dropped when its heading matches AND
+- * most of its body looks like entries; anything ambiguous is kept.
++ * every nonblank body line looks like an entry; anything ambiguous is kept.
+  */
+ export function filterNonContentPages(pages: readonly PdfPage[]): { pages: PdfPage[]; skippedCount: number; skippedTypes: ("contents" | "index")[] } {
+ 	const kept: PdfPage[] = [];
+@@ -372,11 +372,11 @@ export function filterNonContentPages(pages: readonly PdfPage[]): { pages: PdfPa
+ 		const body = lines.slice(1);
+ 		const contents = CONTENTS_HEADING.test(heading.replace(/^#+\s*/, ""))
+ 			&& body.length >= 3
+-			&& body.filter((l) => CONTENTS_ENTRY.test(l)).length * 2 >= body.length;
++			&& body.every((l) => CONTENTS_ENTRY.test(l));
+ 		const index = !contents
+ 			&& INDEX_HEADING.test(heading.replace(/^#+\s*/, ""))
+ 			&& body.length >= 3
+-			&& body.filter((l) => INDEX_ENTRY.test(l)).length * 2 >= body.length;
++			&& body.every((l) => INDEX_ENTRY.test(l));
+ 		if (!contents && !index) {
+ 			kept.push(page);
+ 			continue;
+diff --git a/src/agent/tools/safe-fetch.ts b/src/agent/tools/safe-fetch.ts
+index a4b9975..e34bce0 100644
+--- a/src/agent/tools/safe-fetch.ts
++++ b/src/agent/tools/safe-fetch.ts
+@@ -41,6 +41,7 @@ for (const [network, prefix] of [
+ 	["2002::", 16], // 6to4
+ 	["fc00::", 7], // unique local
+ 	["fe80::", 10], // link-local
++	["fec0::", 10], // deprecated site-local
+ 	["ff00::", 8], // multicast
+ ] as const) NON_PUBLIC.addSubnet(network, prefix, "ipv6");
+ 
+diff --git a/src/core/contracts/graph.ts b/src/core/contracts/graph.ts
+index c0bce3a..6596951 100644
+--- a/src/core/contracts/graph.ts
++++ b/src/core/contracts/graph.ts
+@@ -82,15 +82,16 @@ export interface NotesSource {
+ 	filePath: string;
+ 	/** ISO — when this file was imported (the checkpoint's foldedAt). */
+ 	importedAt: string;
+-	/** Legacy content fingerprint. Accepted when reading old records, but
+-	 * ignored: every explicit notes import processes the whole file. New
+-	 * imports do not compute or write this field. No migration is needed. */
++	/** Legacy content fingerprint, ignored by extraction. New imports use
++	 * resume.fp for incomplete runs and do not write this field. */
+ 	contentFp?: string;
+-	/** Incomplete-run checkpoint: the chunking inputs' fingerprint plus the
+-	 * leading chunks already merged. Written after each merged chunk and
+-	 * cleared when a run completes, so a stopped import of the same file
+-	 * text resumes at `done` instead of re-paying earlier chunks. A changed
+-	 * file (or chunk size) has a different fp and starts from the top. */
++	/** Incomplete-run checkpoint: fp is 32 lowercase hex characters; chunks
++	 * and done are positive safe integers with done <= chunks. Persisted
++	 * after each leading merge, before layout and usage. A full prefix can
++	 * remain if cleanup fails; a matching retry skips all model calls and
++	 * clears it. Completion clears it so the next explicit import runs whole.
++	 * Changed text or chunk budget clears an incompatible checkpoint before
++	 * extraction. Disk reads discard invalid resume data, not its source. */
+ 	resume?: { fp: string; chunks: number; done: number };
+ 	/** The run's usage log — same append-only discipline as
+ 	 *  ChatRecord.extractions, idempotent per startedAt. */
+diff --git a/src/store/graph.ts b/src/store/graph.ts
+index d47fd39..a733316 100644
+--- a/src/store/graph.ts
++++ b/src/store/graph.ts
+@@ -281,7 +281,14 @@ function readSourceMap(): Record<string, NotesSource> {
+ 		if (!isRecord(parsed)) return {};
+ 		const out: Record<string, NotesSource> = {};
+ 		for (const [id, value] of Object.entries(parsed)) {
+-			if (isNotesSource(value)) out[id] = value;
++			if (!isNotesSource(value)) continue;
++			if (value.resume !== undefined && !isNotesResume(value.resume)) {
++				const source = { ...value };
++				delete source.resume;
++				out[id] = source;
++			} else {
++				out[id] = value;
++			}
+ 		}
+ 		return out;
+ 	} catch {
+@@ -316,3 +323,8 @@ function writeSourceMap(map: Record<string, NotesSource>): void {
+ 
+ const isNotesSource = (v: unknown): v is NotesSource =>
+ 	isRecord(v) && isString(v.id) && isString(v.filePath) && isString(v.importedAt);
++
++const isNotesResume = (v: unknown): v is NonNullable<NotesSource["resume"]> =>
++	isRecord(v) && isString(v.fp) && /^[0-9a-f]{32}$/.test(v.fp) &&
++	typeof v.chunks === "number" && Number.isSafeInteger(v.chunks) && v.chunks > 0 &&
++	typeof v.done === "number" && Number.isSafeInteger(v.done) && v.done > 0 && v.done <= v.chunks;
+diff --git a/tests/extraction-resume.test.ts b/tests/extraction-resume.test.ts
+index 943c576..0311402 100644
+--- a/tests/extraction-resume.test.ts
++++ b/tests/extraction-resume.test.ts
+@@ -155,4 +155,148 @@ describe("resumable notes extraction", () => {
+ 		await assert.rejects(pipeline(ledgers, countingExtractor(1).engine).importNotes(input), unfinished);
+ 		assert.equal(ledgers.readSources()[0]!.resume, undefined);
+ 	});
++
++	it("retries a final usage write failure without model calls, then explicitly re-imports all chunks", async () => {
++		const ledgers = memoryLedgers();
++		const first = countingExtractor();
++		const appendUsage = ledgers.appendSourceUsage;
++		let failUsage = true;
++		ledgers.appendSourceUsage = (id, entry) => {
++			if (failUsage && first.calls() === 3 && entry.stats) {
++				failUsage = false;
++				throw new Error("synthetic final usage write failure");
++			}
++			appendUsage(id, entry);
++		};
++		await assert.rejects(pipeline(ledgers, first.engine).importNotes(input), (error: unknown) => {
++			unfinished(error);
++			assert.ok(error instanceof NotesImportError);
++			assert.match(error.message, /synthetic final usage write failure/);
++			assert.equal(error.partialStats.nodes, 3, "all merges landed even though usage persistence failed");
++			return true;
++		});
++		assert.equal(first.calls(), 3);
++		const checkpoint = ledgers.readSources()[0]!.resume;
++		assert.deepEqual(checkpoint && { chunks: checkpoint.chunks, done: checkpoint.done }, { chunks: 3, done: 3 });
++		const usage = ledgers.readSources()[0]!.extractions;
++
++		const retry = countingExtractor();
++		const stats = await pipeline(ledgers, retry.engine).importNotes(input);
++		assert.equal(retry.calls(), 0, "a full committed prefix skips all extractor calls");
++		assert.deepEqual(stats, { nodes: 0, chains: 0 });
++		assert.equal(ledgers.readSources()[0]!.resume, undefined);
++		assert.deepEqual(ledgers.readSources()[0]!.extractions, usage, "a no-model retry invents no usage recovery");
++
++		const reimport = countingExtractor();
++		await pipeline(ledgers, reimport.engine).importNotes(input);
++		assert.equal(reimport.calls(), 3, "clearing the checkpoint keeps explicit re-import whole");
++	});
++
++	for (const [label, fields] of [
++		["fractional done", { done: 1.5 }],
++		["done exceeds chunks", { done: 4 }],
++		["string done", { done: "2" }],
++		["string chunks", { chunks: "3" }],
++	] as const) {
++		it(`restarts every chunk for an injected malformed checkpoint (${label})`, async () => {
++			const ledgers = memoryLedgers();
++			await assert.rejects(pipeline(ledgers, countingExtractor(3).engine).importNotes(input), unfinished);
++			const source = ledgers.readSources()[0]!;
++			const resume = JSON.parse(JSON.stringify({ ...source.resume, ...fields }));
++			ledgers.upsertSource({ ...source, resume });
++
++			const retry = countingExtractor();
++			await pipeline(ledgers, retry.engine).importNotes(input);
++			assert.equal(retry.calls(), 3, "injected stores must not bypass checkpoint validation");
++			assert.equal(ledgers.readSources()[0]!.resume, undefined);
++		});
++	}
++
++	it("clears an incompatible checkpoint before changed text fails, so reverting text starts whole", async () => {
++		const ledgers = memoryLedgers();
++		await assert.rejects(pipeline(ledgers, countingExtractor(3).engine).importNotes(input), unfinished);
++		const changed = countingExtractor(1);
++		await assert.rejects(pipeline(ledgers, changed.engine).importNotes({ filePath: input.filePath, text: "changed first chunk line" }), unfinished);
++		assert.equal(changed.calls(), 1);
++		assert.equal(ledgers.readSources()[0]!.resume, undefined, "the old text's checkpoint is gone before the first changed chunk runs");
++
++		const reverted = countingExtractor();
++		await pipeline(ledgers, reverted.engine).importNotes(input);
++		assert.equal(reverted.calls(), 3, "reverting text must not resurrect the old completed prefix");
++	});
++
++	it("clears an incompatible chunk budget before extraction starts", async () => {
++		const ledgers = memoryLedgers();
++		await assert.rejects(pipeline(ledgers, countingExtractor(3).engine).importNotes(input), unfinished);
++		const changed = countingExtractor(1);
++		const changedPipeline = createExtractionPipeline({
++			chatStore,
++			graphStore: ledgers,
++			getChunkTokens: () => 100,
++			extractor: changed.engine,
++			auditor: fauxEngine([() => fauxAssistantMessage([fauxToolCall("submit_review", VERDICT as unknown as ToolCall["arguments"])], { stopReason: "toolUse" })]),
++		});
++		await assert.rejects(changedPipeline.importNotes(input), unfinished);
++		assert.equal(changed.calls(), 1);
++		assert.equal(ledgers.readSources()[0]!.resume, undefined);
++
++		const retry = countingExtractor();
++		await pipeline(ledgers, retry.engine).importNotes(input);
++		assert.equal(retry.calls(), 3);
++	});
++
++	it("does not advance the prefix when persisting the checkpoint fails", async () => {
++		const ledgers = memoryLedgers();
++		const upsertSource = ledgers.upsertSource;
++		let failCheckpoint = true;
++		ledgers.upsertSource = (source) => {
++			if (failCheckpoint && source.resume) {
++				failCheckpoint = false;
++				throw new Error("synthetic checkpoint write failure");
++			}
++			upsertSource(source);
++		};
++		const first = countingExtractor();
++		await assert.rejects(pipeline(ledgers, first.engine).importNotes(input), unfinished);
++		assert.equal(first.calls(), 3);
++		assert.equal(ledgers.readSources()[0]!.resume, undefined, "later merges cannot jump over the unpersisted leading chunk");
++
++		const retry = countingExtractor();
++		await pipeline(ledgers, retry.engine).importNotes(input);
++		assert.equal(retry.calls(), 3);
++	});
++
++	it("persists a committed checkpoint before layout fails", async () => {
++		const ledgers = memoryLedgers();
++		const writePositions = ledgers.writePositions;
++		ledgers.writePositions = () => { throw new Error("synthetic layout write failure"); };
++		const first = countingExtractor();
++		await assert.rejects(pipeline(ledgers, first.engine).importNotes(input), unfinished);
++		assert.equal(first.calls(), 3);
++		assert.equal(ledgers.readSources()[0]!.resume?.done, 3, "layout failure must not erase committed merges");
++		assert.deepEqual(ledgers.readPositions(), {});
++		const failedRetry = countingExtractor();
++		await assert.rejects(pipeline(ledgers, failedRetry.engine).importNotes(input), (error: unknown) => {
++			unfinished(error);
++			assert.ok(error instanceof NotesImportError);
++			assert.match(error.message, /synthetic layout write failure/);
++			return true;
++		});
++		assert.equal(failedRetry.calls(), 0);
++		assert.equal(ledgers.readSources()[0]!.resume?.done, 3);
++		ledgers.writePositions = writePositions;
++
++		const retry = countingExtractor();
++		const stats = await pipeline(ledgers, retry.engine).importNotes(input);
++		assert.equal(retry.calls(), 0);
++		assert.deepEqual(stats, { nodes: 0, chains: 0 });
++		const positions = ledgers.readPositions();
++		assert.ok(Object.keys(positions).length > 0, "completed retry restores the rendered layout ledger");
++		for (const node of ledgers.readNodes()) {
++			const position = positions[node.id];
++			assert.ok(position, `missing rendered position for ${node.id}`);
++			assert.ok(Number.isFinite(position.x) && Number.isFinite(position.y), `nonfinite rendered position for ${node.id}`);
++		}
++		assert.equal(ledgers.readSources()[0]!.resume, undefined);
++	});
+ });
+diff --git a/tests/notes-import-pdf-converter.test.ts b/tests/notes-import-pdf-converter.test.ts
+new file mode 100644
+index 0000000..9151b50
+--- /dev/null
++++ b/tests/notes-import-pdf-converter.test.ts
+@@ -0,0 +1,189 @@
++import assert from "node:assert/strict";
++import childProcess from "node:child_process";
++import fs from "node:fs";
++import { syncBuiltinESMExports } from "node:module";
++import os from "node:os";
++import path from "node:path";
++import { after, beforeEach, it } from "node:test";
++import { promisify } from "node:util";
++import { tinyPdf } from "./helpers/tiny-pdf.ts";
++
++const root = fs.mkdtempSync(path.join(os.tmpdir(), "lh-import-pdf-converter-"));
++const authFile = path.join(root, "auth.json");
++process.env.LH_DATA_DIR = root;
++process.env.LH_AUTH_FILE = authFile;
++fs.writeFileSync(authFile, "{}");
++const credentials = ["BAIDU_OCR_ACCESS_TOKEN", "BAIDU_OCR_API_KEY", "BAIDU_OCR_SECRET_KEY"];
++const originalCredentials = credentials.map((key) => process.env[key]);
++for (const key of credentials) delete process.env[key];
++
++let markdown = "# External document\n\nFull external text.";
++let ocrText = "";
++const convertedInputs: Uint8Array[] = [];
++let ocrCalls = 0;
++// `promisify.custom` is non-configurable on the real execFile, so install a
++// replacement export carrying the stubbed promisified implementation. The
++// converter modules read that export when they are imported below.
++const originalExecFile = childProcess.execFile;
++const stub = function execFile() { throw new Error("callback execFile path is not used"); };
++Object.defineProperty(stub, promisify.custom, {
++	configurable: true,
++	value: async (file: string, args: string[]) => {
++		if (file === "markitdown" || file === "markitdown.cmd") {
++			convertedInputs.push(new Uint8Array(fs.readFileSync(args[0]!)));
++			return { stdout: markdown, stderr: "" };
++		}
++		if (file === "paddleocr" || file === "paddleocr.exe") {
++			ocrCalls++;
++			const png = fs.readFileSync(args[1]!);
++			assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
++			return { stdout: ocrText, stderr: "" };
++		}
++		throw new Error(`Unexpected executable: ${file}`);
++	},
++});
++Object.defineProperty(childProcess, "execFile", { configurable: true, writable: true, value: stub });
++syncBuiltinESMExports();
++
++after(() => {
++	Object.defineProperty(childProcess, "execFile", { configurable: true, writable: true, value: originalExecFile });
++	syncBuiltinESMExports();
++	for (const [i, key] of credentials.entries()) {
++		const original = originalCredentials[i];
++		if (original === undefined) delete process.env[key];
++		else process.env[key] = original;
++	}
++	fs.rmSync(root, { recursive: true, force: true });
++});
++
++// Dynamic on purpose: the env roots and the stubbed execFile must be in place
++// before these modules (and their converter imports) evaluate.
++const { POST } = await import("../app/api/graph/import/route.ts");
++const { extraction, sourceDirectory, writeSettingsRecord } = await import("../src/server/index.ts");
++const originalImport = extraction.importNotes;
++const originalRegister = sourceDirectory.registerImport;
++const received: string[] = [];
++const registered: string[] = [];
++extraction.importNotes = async ({ text }) => { received.push(text); return { nodes: 0, chains: 0 }; };
++sourceDirectory.registerImport = (filePath) => { registered.push(filePath); };
++after(() => { extraction.importNotes = originalImport; sourceDirectory.registerImport = originalRegister; });
++beforeEach(() => {
++	convertedInputs.length = 0;
++	received.length = 0;
++	registered.length = 0;
++	ocrCalls = 0;
++	ocrText = "";
++	markdown = "# External document\n\nFull external text.";
++	writeSettingsRecord({ version: 1, graph: { ocrBaiduEnabled: false } });
++});
++
++async function upload(bytes: Uint8Array<ArrayBuffer> | string) {
++	const form = new FormData();
++	form.append("files", new File([bytes], "document.pdf"));
++	const response = await POST(new Request("http://localhost/api/graph/import", { method: "POST", body: form }));
++	assert.equal(response.status, 200);
++	const { results } = await response.json();
++	assert.equal(results.length, 1);
++	return results[0];
++}
++
++function toc() {
++	return {
++		runs: ["Table of Contents", "Chapter 1: Intro ...... 1", "Chapter 2: Core ....... 15", "Chapter 3: Advanced ... 40"]
++			.map((text, i) => ({ text, x: 72, y: 700 - i * 30, size: i === 0 ? 20 : 10 })),
++	};
++}
++
++it("a successful full-document converter remains available after PDF preflight", async () => {
++	const pdf = tinyPdf([{ runs: [{ text: "Built-in text", x: 72, y: 600 }] }]);
++	const result = await upload(pdf);
++	assert.equal(result.ok, true);
++	assert.equal(result.notice, "Converted with Microsoft MarkItDown.");
++	assert.deepEqual(received, ["# External document\n\nFull external text."]);
++	assert.deepEqual(convertedInputs, [pdf], "external converter receives the original bytes, not a detached buffer");
++});
++
++it("a successful external converter cannot bypass the page cap or unreadable refusal", async () => {
++	for (const [bytes, error] of [
++		[tinyPdf(Array.from({ length: 1001 }, () => ({}))), "Too long. Max 1,000 pages."],
++		["%PDF-1.4\nnot really a pdf", "Could not open this PDF."],
++	] as const) {
++		const result = await upload(bytes);
++		assert.equal(result.ok, false);
++		assert.equal(result.error, error);
++	}
++	assert.deepEqual(convertedInputs, []);
++	assert.deepEqual(received, []);
++	assert.deepEqual(registered, []);
++});
++
++it("external full-document text cannot reintroduce filtered navigation pages", async () => {
++	const result = await upload(tinyPdf([toc(), { runs: [{ text: "Plants make sugar.", x: 72, y: 600 }] }]));
++	assert.equal(result.ok, true);
++	assert.equal(result.notice, "Scanned pages may have errors. Skipped 1 contents page.");
++	assert.deepEqual(received, ["--- Page 2 ---\n\nPlants make sugar."]);
++	assert.deepEqual(convertedInputs, []);
++});
++
++it("all-navigation refusal cannot be overridden by successful external text", async () => {
++	const result = await upload(tinyPdf([toc()]));
++	assert.equal(result.ok, false);
++	assert.equal(result.error, "No content remains after skipping contents/index pages.");
++	assert.deepEqual(convertedInputs, []);
++	assert.deepEqual(received, []);
++	assert.deepEqual(registered, []);
++});
++
++it("whitespace-only external output retains the built-in fallback", async () => {
++	markdown = " \n\t ";
++	const result = await upload(tinyPdf([{ runs: [{ text: "Built-in text", x: 72, y: 600 }] }]));
++	assert.equal(result.ok, true);
++	assert.equal(result.notice, "Scanned pages may have errors.");
++	assert.deepEqual(received, ["--- Page 1 ---\n\nBuilt-in text"]);
++	assert.equal(convertedInputs.length, 1);
++});
++
++it("image-only PDFs retain successful external conversion and existing empty-output refusal", async () => {
++	assert.equal((await upload(tinyPdf([{ image: true }]))).ok, true);
++	assert.deepEqual(received, ["# External document\n\nFull external text."]);
++	markdown = " \n ";
++	const result = await upload(tinyPdf([{ image: true }]));
++	assert.equal(result.ok, false);
++	assert.equal(result.error, "OCR not supported yet.");
++	assert.equal(received.length, 1);
++	assert.equal(convertedInputs.length, 2);
++});
++
++it("successful opt-in OCR is preserved instead of replaced by external text", async () => {
++	writeSettingsRecord({ version: 1, graph: { ocrBaiduEnabled: true } });
++	ocrText = "Recognized scan text.";
++	const result = await upload(tinyPdf([{ image: true }]));
++	assert.equal(result.ok, true);
++	assert.equal(result.notice, "Scanned pages may have errors. Processed with Baidu OCR.");
++	assert.deepEqual(received, ["--- Page 1 ---\n\nRecognized scan text."]);
++	assert.equal(ocrCalls, 1);
++	assert.deepEqual(convertedInputs, []);
++});
++
++it("an OCR attempt with no recognized pages can still use external conversion", async () => {
++	writeSettingsRecord({ version: 1, graph: { ocrBaiduEnabled: true } });
++	const pdf = tinyPdf([{ image: true }]);
++	const result = await upload(pdf);
++	assert.equal(result.ok, true);
++	assert.equal(result.notice, "Converted with Microsoft MarkItDown.");
++	assert.equal(ocrCalls, 1);
++	assert.deepEqual(convertedInputs, [pdf]);
++	assert.deepEqual(received, ["# External document\n\nFull external text."]);
++});
++
++it("navigation recognized by OCR is classified before any external fallback", async () => {
++	writeSettingsRecord({ version: 1, graph: { ocrBaiduEnabled: true } });
++	ocrText = "Table of Contents\nChapter 1: Intro ...... 1\nChapter 2: Core ....... 15\nChapter 3: Advanced ... 40";
++	const result = await upload(tinyPdf([{ image: true }]));
++	assert.equal(result.ok, false);
++	assert.equal(result.error, "No content remains after skipping contents/index pages.");
++	assert.equal(ocrCalls, 1);
++	assert.deepEqual(convertedInputs, []);
++	assert.deepEqual(received, []);
++	assert.deepEqual(registered, []);
++});
+diff --git a/tests/notes-import-route.test.ts b/tests/notes-import-route.test.ts
+index ba30838..28cde8a 100644
+--- a/tests/notes-import-route.test.ts
++++ b/tests/notes-import-route.test.ts
+@@ -204,6 +204,88 @@ it("PDFs with nothing to import are refused before any model call", async () =>
+ 	}
+ });
+ 
++it("a text-only navigation PDF is refused with the contents/index error before any model call", async () => {
++	let calls = 0;
++	extraction.importNotes = async () => { calls++; return { nodes: 0, chains: 0 }; };
++	const pdf = tinyPdf([
++		["Table of Contents", "Chapter 1: Intro ...... 1", "Chapter 2: Core ....... 15", "Chapter 3: Advanced ... 40"],
++		["Index", "Abstraction, 12, 14, 99", "Algorithm, 5, 23, 45", "Array, 18, 32"],
++	].map((lines) => ({
++		runs: lines.map((text, i) => ({ text, x: 72, y: 700 - i * 30, size: i === 0 ? 20 : 10 })),
++	})));
++	const response = await POST(upload([{ name: "navigation.pdf", bytes: pdf }]));
++	assert.equal(response.status, 200);
++	assert.deepEqual((await response.json()).results, [{
++		filePath: "navigation.pdf",
++		requestIndex: 0,
++		outcome: "failed",
++		ok: false,
++		error: "No content remains after skipping contents/index pages.",
++	}]);
++	assert.equal(calls, 0);
++});
++
++for (const includeContent of [false, true]) it(`three repeated TOC headings are filtered before cleanup (${includeContent ? "with content" : "navigation only"})`, async () => {
++	const received: string[] = [];
++	extraction.importNotes = async ({ text }) => { received.push(text); return { nodes: 0, chains: 0 }; };
++	const toc = Array.from({ length: 3 }, (_, page) => ({
++		runs: [
++			"Table of Contents",
++			`Chapter ${page * 3 + 1}: Intro ...... ${page * 30 + 1}`,
++			`Chapter ${page * 3 + 2}: Core ....... ${page * 30 + 15}`,
++			`Chapter ${page * 3 + 3}: Advanced ... ${page * 30 + 29}`,
++		].map((text, i) => ({ text, x: 72, y: 700 - i * 30, size: i === 0 ? 20 : 10 })),
++	}));
++	const pdf = tinyPdf([
++		...toc,
++		...(includeContent ? [{ runs: [{ text: "Plants make sugar.", x: 72, y: 600 }] }] : []),
++	]);
++	const response = await POST(upload([{ name: "repeated-toc.pdf", bytes: pdf }]));
++	assert.equal(response.status, 200);
++	const { results } = await response.json();
++	assert.equal(results.length, 1);
++	if (includeContent) {
++		assert.equal(results[0].ok, true);
++		assert.equal(results[0].notice, "Scanned pages may have errors. Skipped 3 contents pages.");
++		assert.deepEqual(received, ["--- Page 4 ---\n\nPlants make sugar."]);
++	} else {
++		assert.equal(results[0].ok, false);
++		assert.equal(results[0].error, "No content remains after skipping contents/index pages.");
++		assert.deepEqual(received, []);
++	}
++});
++
++for (const { heading, entries } of [
++	{
++		heading: "Table of Contents",
++		entries: ["Chapter 1: Intro ...... 1", "Chapter 2: Core ....... 15", "Chapter 3: Advanced ... 40"],
++	},
++	{
++		heading: "Index",
++		entries: ["Abstraction, 12, 14, 99", "Algorithm, 5, 23, 45", "Array, 18, 32"],
++	},
++]) {
++	for (const entryCount of [2, 3]) {
++		it(`a ${heading} PDF with ${entryCount} entries and ${4 - entryCount} prose lines reaches the pipeline intact`, async () => {
++			const received: string[] = [];
++			extraction.importNotes = async ({ text }) => { received.push(text); return { nodes: 0, chains: 0 }; };
++			const prose = ["Plants make sugar using sunlight.", "Roots absorb water from the soil."].slice(0, 4 - entryCount);
++			const body = [...entries.slice(0, entryCount), ...prose];
++			const pdf = tinyPdf([{
++				runs: [heading, ...body].map((text, i) => ({ text, x: 72, y: 700 - i * 30, size: i === 0 ? 20 : 10 })),
++			}]);
++			const response = await POST(upload([{ name: "mixed.pdf", bytes: pdf }]));
++			assert.equal(response.status, 200);
++			const { results } = await response.json();
++			assert.equal(results.length, 1);
++			assert.equal(results[0].ok, true);
++			assert.equal(results[0].outcome, "completed");
++			assert.equal(results[0].notice, "Scanned pages may have errors.");
++			assert.deepEqual(received, [`--- Page 1 ---\n\n# ${heading}\n\n${body.join("\n\n")}`]);
++		});
++	}
++}
++
+ it("PDF notices count only image-only pages, not blanks, and preserve the scanner caveat for text-only PDFs", async () => {
+ 	extraction.importNotes = async () => ({ nodes: 0, chains: 0 });
+ 	const text = { runs: [{ text: "Text page", x: 72, y: 600 }] };
+diff --git a/tests/notes-source-resume-store.test.ts b/tests/notes-source-resume-store.test.ts
+new file mode 100644
+index 0000000..786c8c6
+--- /dev/null
++++ b/tests/notes-source-resume-store.test.ts
+@@ -0,0 +1,76 @@
++import assert from "node:assert/strict";
++import * as fs from "node:fs/promises";
++import * as os from "node:os";
++import * as path from "node:path";
++import { after, describe, it } from "node:test";
++import type { NotesSource } from "../src/core/contracts.ts";
++
++const root = await fs.mkdtemp(path.join(os.tmpdir(), "lh-notes-resume-store-"));
++const previous = Object.fromEntries(["HOME", "USERPROFILE", "LH_AUTH_FILE", "LH_DATA_DIR"].map((key) => [key, process.env[key]]));
++Object.assign(process.env, { HOME: root, USERPROFILE: root, LH_AUTH_FILE: path.join(root, "auth.json"), LH_DATA_DIR: path.join(root, "data") });
++after(async () => {
++	for (const [key, value] of Object.entries(previous)) {
++		if (value === undefined) delete process.env[key]; else process.env[key] = value;
++	}
++	await fs.rm(root, { recursive: true, force: true });
++});
++
++// Exercise the module-loading boundary: static imports would capture real data paths before isolation.
++const { SOURCES_FILE } = await import("../config.ts");
++const { graphStore } = await import("../src/store/graph.ts");
++const fp = "0123456789abcdef0123456789abcdef";
++const source: NotesSource = {
++	id: "src_resume_fixture",
++	filePath: "/vault/fixture.md",
++	importedAt: "2026-11-13T00:00:00.000Z",
++	contentFp: "legacy-fingerprint",
++	extractions: [{
++		startedAt: 1,
++		at: "2026-11-13T00:00:00.000Z",
++		durationMs: 10,
++		stats: { nodes: 1, chains: 0 },
++		stages: { extractor: { model: "fixture:extractor", steps: [] }, auditor: { model: "fixture:auditor", steps: [] } },
++	}],
++};
++
++async function writeSource(resume: unknown): Promise<string> {
++	const raw = JSON.stringify({ [source.id]: { ...source, resume } });
++	await fs.mkdir(path.dirname(SOURCES_FILE), { recursive: true });
++	await fs.writeFile(SOURCES_FILE, raw);
++	return raw;
++}
++
++describe("notes source resume disk validation", () => {
++	for (const done of [1, 3]) {
++		it(`keeps a valid checkpoint with ${done} of 3 chunks merged`, async () => {
++			const resume = { fp, chunks: 3, done };
++			const raw = await writeSource(resume);
++			assert.deepEqual(graphStore.readSources(), [{ ...source, resume }]);
++			assert.equal(await fs.readFile(SOURCES_FILE, "utf-8"), raw, "reads do not rewrite the source map");
++		});
++	}
++
++	const invalid: Array<[string, unknown]> = [
++		["null", null], ["array", []], ["string", "checkpoint"],
++		["uppercase fingerprint", { fp: fp.toUpperCase(), chunks: 3, done: 1 }],
++		["nonhex fingerprint", { fp: "g".repeat(32), chunks: 3, done: 1 }],
++		["short fingerprint", { fp: fp.slice(1), chunks: 3, done: 1 }],
++		["missing fingerprint", { chunks: 3, done: 1 }],
++		...[0, -1, 1.5, "3", Number.MAX_SAFE_INTEGER + 1].map((chunks): [string, unknown] => [`chunks ${chunks}`, { fp, chunks, done: 1 }]),
++		...[0, -1, 1.5, "1", 4, Number.MAX_SAFE_INTEGER + 1].map((done): [string, unknown] => [`done ${done}`, { fp, chunks: 3, done }]),
++	];
++	for (const [label, resume] of invalid) {
++		it(`drops only the invalid checkpoint (${label}), keeping source metadata and usage`, async () => {
++			const raw = await writeSource(resume);
++			assert.deepEqual(graphStore.readSources(), [source]);
++			assert.equal(await fs.readFile(SOURCES_FILE, "utf-8"), raw, "validation is read-only");
++		});
++	}
++
++	it("preserves usage when upserting a source whose disk checkpoint was invalid", async () => {
++		await writeSource({ fp, chunks: 3, done: 1.5 });
++		const importedAt = "2026-11-14T00:00:00.000Z";
++		graphStore.upsertSource({ id: source.id, filePath: source.filePath, importedAt });
++		assert.deepEqual(graphStore.readSources(), [{ id: source.id, filePath: source.filePath, importedAt, extractions: source.extractions }]);
++	});
++});
+diff --git a/tests/pdf-content-filter.test.ts b/tests/pdf-content-filter.test.ts
+index 48bf76a..9624fa7 100644
+--- a/tests/pdf-content-filter.test.ts
++++ b/tests/pdf-content-filter.test.ts
+@@ -3,6 +3,32 @@ import { describe, it } from "node:test";
+ import { filterNonContentPages, type PdfPage } from "../src/agent/subagents/pdf-markdown.ts";
+ 
+ describe("filterNonContentPages", () => {
++	for (const { heading, entries } of [
++		{
++			heading: "Table of Contents",
++			entries: ["Chapter 1: Intro ...... 1", "Chapter 2: Core ....... 15", "Chapter 3: Advanced ... 40"],
++		},
++		{
++			heading: "Index",
++			entries: ["Abstraction, 12, 14, 99", "Algorithm, 5, 23, 45", "Array, 18, 32"],
++		},
++	]) {
++		for (const entryCount of [2, 3]) {
++			it(`retains ${heading} pages with ${entryCount} entries and ${4 - entryCount} prose lines`, () => {
++				const prose = ["Plants make sugar using sunlight.", "Roots absorb water from the soil."].slice(0, 4 - entryCount);
++				const pages: PdfPage[] = [{
++					kind: "text",
++					number: 1,
++					markdown: [`# ${heading}`, ...entries.slice(0, entryCount), ...prose].join("\n"),
++				}];
++				const result = filterNonContentPages(pages);
++				assert.deepEqual(result.pages, pages);
++				assert.equal(result.skippedCount, 0);
++				assert.deepEqual(result.skippedTypes, []);
++			});
++		}
++	}
++
+ 	it("preserves ordinary content pages", () => {
+ 		const pages: PdfPage[] = [
+ 			{ kind: "text", number: 1, markdown: "# Chapter 1\nThis is core subject matter." },
+diff --git a/tests/safe-fetch.test.ts b/tests/safe-fetch.test.ts
+index 68fb839..deeca98 100644
+--- a/tests/safe-fetch.test.ts
++++ b/tests/safe-fetch.test.ts
+@@ -41,6 +41,7 @@ describe("isPublicAddress", () => {
+ 			"127.0.0.1", "127.255.255.254", "10.0.0.1", "172.16.0.1", "172.31.255.255", "192.168.1.1",
+ 			"169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "198.18.0.1",
+ 			"::1", "::", "fd00::1", "fc00::1", "fe80::1", "ff02::1", "64:ff9b::a00:1", "2002:a00:1::",
++			"fec0::1", "fed0::1", "feff::1", "fec0:0000:0000:0000:0000:0000:0000:0001", "[fec0::1]",
+ 			"::ffff:127.0.0.1", "::ffff:10.0.0.1", "[::1]", "::FFFF:169.254.169.254",
+ 			"not an ip", "",
+ 		]) {
+@@ -88,6 +89,12 @@ describe("research fetch tools refuse local destinations", () => {
+ 	});
+ });
+ 
++it("safeFetch refuses site-local IPv6 literals before attempting a connection", async () => {
++	for (const address of ["fec0::1", "fed0::1", "feff::1"]) {
++		await assert.rejects(safeFetch(`http://[${address}]:65535/`), /refusing to connect to a private or local address/);
++	}
++});
++
+ describe("redirects are checked at every hop", () => {
+ 	it("an allowed page redirecting to a refused address is stopped before the second request", async () => {
+ 		const secret = await server("127.0.0.1", (_req, res) => res.end("internal secret"));
+-- 
+2.53.0.windows.1
+
