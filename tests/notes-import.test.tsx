@@ -8,8 +8,9 @@ import { parseHTML } from "linkedom";
 import { InteractionLayersProvider } from "../components/interaction-layers.tsx";
 import { installModalDom } from "./modal-dom.ts";
 import { IMPORT_EXTENSIONS } from "../lib/notes-import-limits.ts";
-import { MAX_IMPORT_BYTES, NotesImportControl, NotesImportErrors, NotesImportNotices, parseNotesImportResults, postNotesImport, useNotesImport, type NotesImportResult } from "../components/notes-import.tsx";
+import { MAX_IMPORT_BYTES, NotesImportControl, NotesImportNotices, parseNotesImportResults, postNotesImport, useNotesImport, type NotesImportResult } from "../components/notes-import.tsx";
 
+import { ImportErrorToasts } from "../components/import-error-toasts.tsx";
 const dom = parseHTML("<html><body></body></html>");
 Object.assign(globalThis, { window: dom.window, document: dom.document, HTMLElement: dom.window.HTMLElement, Element: dom.window.Element, IS_REACT_ACT_ENVIRONMENT: true });
 const restoreModalDom = installModalDom(dom);
@@ -23,7 +24,7 @@ async function mount() {
 	host = document.createElement("div"); document.body.appendChild(host); root = createRoot(host);
 	function Harness() {
 		current = useNotesImport({ onStart: () => { starts++; }, onFinish: () => { finishes++; } });
-		return <NotesImportErrors errors={current.errors} />;
+		return <ImportErrorToasts errors={current.errors} />;
 	}
 	await act(async () => { root!.render(<Harness />); });
 }
@@ -76,11 +77,17 @@ for (const outcome of ["completed", "failed", "partial", "aborted", "busy"] as c
 	assert.equal(current.importing, false); assert.equal(starts, 1); assert.equal(finishes, 1);
 	assert.deepEqual(Object.keys(current).sort(), ["errors", "importing", "notices", "onImportFiles"]);
 	const html = host!.innerHTML;
-	assert.doesNotMatch(html, /<button|<section|<ul|border|bg-card|rounded|shadow|Retry|Dismiss|Import complete/);
+	// Toasts are the popup chrome now: raw failure details must stay escaped
+	// text with no retry/import-complete controls; the dismiss button is
+	// the toast's own, deliberate control.
+	assert.doesNotMatch(html, /Retry|Import complete/);
 	if (outcome === "completed") { assert.equal(html, ""); assert.deepEqual(current.errors, []); }
 	else {
 		assert.deepEqual(current.errors, [`${file.name}: ${result.error}\nprovider_key_missing — openai — OPENAI_API_KEY — cheap, strong`]);
-		assert.match(html, /&lt;script&gt;notes.md: &lt;img&gt;synthetic failure/); assert.match(html, /role="alert"/); assert.doesNotMatch(html, /<script>|<img>/);
+		assert.equal((host!.textContent ?? "").includes("synthetic failure"), true, "unescaped raw words readable as text");
+		assert.equal((host!.textContent ?? "").includes("provider_key_missing — openai — OPENAI_API_KEY — cheap, strong"), true, "details survive");
+		assert.match(html, /role="alert"/); assert.match(html, /Dismiss error/);
+		assert.doesNotMatch(html, /<script>|<img>/);
 	}
 });
 for (const details of [{ code: "models_not_configured", missing: ["cheap", "strong", "vision"] }, { code: "provider_key_missing", provider: "openai", slots: ["cheap"] }, { code: "provider_key_missing" }, {}]) it(`configuration details survive (${JSON.stringify(details)})`, async () => {
@@ -185,10 +192,18 @@ it("busy graph action names extraction, and preserves the enabled queue picker",
 	assert.doesNotMatch(html, /Import notes|Importing…|disabled/);
 });
 
-it("alerts/notices stay plain and escaped", () => {
-	assert.equal(renderToStaticMarkup(<NotesImportErrors errors={[]} />), "");
-	const html = renderToStaticMarkup(<NotesImportErrors errors={["one.md: failure", "two.md: failure"]} />);
-	assert.equal((html.match(/role="alert"/g) ?? []).length, 2); assert.doesNotMatch(html, /<section|<button|border|bg-/);
-	const notices = renderToStaticMarkup(<NotesImportNotices notices={["a.pdf: Scanned pages may have errors."]} />);
-	assert.match(notices, /role="status"/); assert.match(notices, /text-muted-foreground/); assert.doesNotMatch(notices, /text-red/);
+it("error toasts collapse duplicates and dismiss individually", async () => {
+	host = document.createElement("div"); document.body.appendChild(host); root = createRoot(host);
+	await act(async () => {
+		root!.render(<ImportErrorToasts errors={["a.md: failure", "a.md: failure", "b.md: other"]} />);
+	});
+	const html = host.innerHTML;
+	assert.equal((html.match(/role="alert"/g) ?? []).length, 2, "one toast per distinct text");
+	assert.match(html, /muncul error yang sama sebanyak 2/);
+	assert.doesNotMatch(html, /muncul error yang sama sebanyak 1/);
+	await act(async () => {
+		host!.querySelector<HTMLButtonElement>('[aria-label="Dismiss error"]')!.click();
+	});
+	assert.match(host.innerHTML, /b\.md: other/, "unrelated toast stays");
+	assert.doesNotMatch(host.innerHTML, /a\.md: failure/, "dismissed toast is gone");
 });
