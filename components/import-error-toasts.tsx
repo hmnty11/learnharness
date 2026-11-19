@@ -44,10 +44,10 @@ export function ImportErrorToasts({ errors }: { errors: readonly string[] }) {
 	if (!visible || latest.length === 0) return null;
 
 	return (
-		<div className="pointer-events-none absolute bottom-4 right-4 z-50 flex flex-col gap-2" data-testid="import-error-toasts">
+		<div className="pointer-events-none absolute inset-x-0 top-1/2 z-50 flex -translate-y-1/2 flex-col items-center gap-2" data-testid="import-error-toasts">
 			{latest.map((toast) => (
 				<div key={toast.text} role="alert" data-testid="import-error-toast"
-					className="pointer-events-auto max-w-sm whitespace-pre-wrap break-words rounded-lg border border-error/40 bg-card px-3 py-2 text-xs text-error shadow-lg">
+					className="pointer-events-auto max-w-xl whitespace-pre-wrap break-words rounded-lg border border-error/40 bg-card px-3 py-2 text-xs text-error shadow-lg">
 					{toast.sameCount > 1 && (
 						<p className="mb-1 font-medium">{`muncul error yang sama sebanyak ${toast.sameCount}`}</p>
 					)}
