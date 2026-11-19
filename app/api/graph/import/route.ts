@@ -73,11 +73,7 @@ async function readNotesFile(file: File, ocrEnabled: boolean = false): Promise<N
 		if (bytes.subarray(0, 8192).includes(0)) return { kind: "refused", error: "This file isn't plain text." };
 		return { kind: "notes", text: new TextDecoder().decode(bytes) };
 	}
-	const markitdown = await convertPdfWithMarkitdown(bytes, file.name);
-	if (markitdown) {
-		return { kind: "notes", text: markitdown.markdown, notice: markitdown.notices.join(" ") };
-	}
-	const pdf = await convertPdf(bytes, MAX_PDF_PAGES);
+	const pdf = await convertPdf(bytes.slice(), MAX_PDF_PAGES);
 	switch (pdf.kind) {
 		case "unreadable":
 			return { kind: "refused", error: "Could not open this PDF." };
@@ -88,15 +84,23 @@ async function readNotesFile(file: File, ocrEnabled: boolean = false): Promise<N
 			let ocrNotice = "";
 			const needsOcr = ocrEnabled && (pages.some((page) => page.kind === "image-only") || !pages.some((page) => page.kind === "text" && page.markdown.trim()));
 			if (needsOcr) {
-				const ocrResult = await applyBaiduOcrToPdf(bytes, pages);
+				const ocrResult = await applyBaiduOcrToPdf(bytes.slice(), pages);
 				pages = ocrResult.pages;
 				if (ocrResult.ocrCount > 0) {
 					ocrNotice = " Processed with Baidu OCR.";
 				}
 			}
-			pages = cleanRepeatingHeadersFooters(pages);
 			const filtered = filterNonContentPages(pages);
-			pages = filtered.pages;
+			pages = cleanRepeatingHeadersFooters(filtered.pages);
+			if (filtered.skippedCount > 0 && !pages.some((page) => page.kind === "text" && page.markdown.trim())) {
+				return { kind: "refused", error: "No content remains after skipping contents/index pages." };
+			}
+			if (filtered.skippedCount === 0 && !ocrNotice) {
+				const markitdown = await convertPdfWithMarkitdown(bytes, file.name);
+				if (markitdown?.markdown.trim()) {
+					return { kind: "notes", text: markitdown.markdown, notice: markitdown.notices.join(" ") };
+				}
+			}
 			const text = joinPages(pages);
 			if (!text) return { kind: "refused", error: "OCR not supported yet." };
 			const skipped = pages.filter((page) => page.kind === "image-only").length;
